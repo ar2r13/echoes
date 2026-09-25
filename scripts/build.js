@@ -37,4 +37,6 @@ if (serving) {
 	console.log(`Local: http://${server.host}:${server.port}`)
 } else {
 	await build(options)
+	await rm(`${root}/dist`, { recursive: true, force: true })
+	await cp(`${root}/www`, `${root}/dist`, { recursive: true })
 }
