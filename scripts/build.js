@@ -12,7 +12,9 @@ await mkdir(`${root}/www`, { recursive: true })
 await Promise.all([
 	cp(`${root}/src/index.html`, `${root}/www/index.html`),
 	cp(`${root}/src/manifest.json`, `${root}/www/manifest.json`),
-	cp(`${root}/src/favicon.svg`, `${root}/www/favicon.svg`)
+	cp(`${root}/src/favicon.svg`, `${root}/www/favicon.svg`),
+	cp(`${root}/src/icon-192.png`, `${root}/www/icon-192.png`),
+	cp(`${root}/src/icon-512.png`, `${root}/www/icon-512.png`)
 ])
 
 const options = {

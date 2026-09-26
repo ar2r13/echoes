@@ -1,5 +1,5 @@
-const cache = 'mirror-v4'
-const shell = ['/', '/index.js', '/index.css', '/manifest.json', '/favicon.svg']
+const cache = 'mirror-v5'
+const shell = ['/', '/index.js', '/index.css', '/manifest.json', '/favicon.svg', '/icon-192.png', '/icon-512.png']
 
 self.addEventListener('install', event => {
 	event.waitUntil(caches.open(cache).then(storage => storage.addAll(shell)))
