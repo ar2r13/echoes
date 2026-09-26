@@ -14,8 +14,13 @@ const lead = .05
 // How far after each click we look for its echo in the mic, and how much of it we cancel.
 const echoWindow = .5
 const echoLength = .09
-const echoPre = .002
+const echoPre = .005
 const echoDepth = 24
+// Phones deliver mic audio with a delay that wanders by a few milliseconds from click to click,
+// so the round trip comes from the loudness envelope and each click is found again on its own.
+const echoBin = .001
+const echoJitter = .012
+const alignLength = .02
 
 // Posts mono mic blocks tagged with the context frame they were rendered at,
 // so every recorded sample has an exact position on the metronome's clock.
@@ -31,6 +36,8 @@ class EchoTap extends AudioWorkletProcessor {
 	process (inputs) {
 		const channel = inputs[0] && inputs[0][0]
 		if (!channel) return true
+		// A skipped quantum would shift everything after it; start a fresh block instead.
+		if (this.fill && currentFrame !== this.start + this.fill) this.fill = 0
 		if (!this.fill) this.start = currentFrame
 		this.block.set(channel, this.fill)
 		this.fill += channel.length
@@ -82,6 +89,10 @@ class AudioController {
 	#rawLevel = 0
 	// Level of the room with nothing played, so a very low threshold never mistakes it for playing.
 	#floor = 0
+	#noteAt = 0
+	#firstNote = 0
+	// Where recent phrases began inside the beat, as the mic heard them.
+	#starts : number[] = []
 	#attemptAt = 0
 	#soundAt = 0
 	#lastSoundAt = 0
@@ -97,10 +108,11 @@ class AudioController {
 	#written = 0
 	// Running average of what the mic hears right after each click: the click as it comes
 	// back through speakers, room and mic. It gives the exact round trip and a template to cancel.
-	#echo : Float32Array | null = null
-	#echoCount = 0
-	#echoStart = -1
-	#echoOnset = 0
+	#envelope : Float32Array | null = null
+	#envelopeCount = 0
+	#echoOnset = -1
+	#template : Float32Array | null = null
+	#templateCount = 0
 
 	get mirrorRunning () {
 		return this.mic.get()
@@ -141,11 +153,14 @@ class AudioController {
 		return Math.min(1, Math.max(0, (this.#context.currentTime - this.#playStart) / phrase.duration))
 	}
 
-	// Output-to-mic round trip. Measured from the metronome's own echo once it is heard;
-	// until then (or with headphones, where nothing leaks) the browser's own estimate.
+	// Output-to-mic round trip. Measured from the metronome's own echo once it is heard.
+	// Phones often strip their own speaker from the mic, so without an echo it is learned
+	// from where phrases start against the beat (as a position inside the beat, which is all
+	// placement needs). The browser's own estimate is the last resort: phones under-report it.
 	get latency () {
 		const context = this.#context
-		if (context && this.#echoStart >= 0) return this.#echoOnset / context.sampleRate
+		if (context && this.#echoOnset >= 0) return this.#echoOnset / context.sampleRate
+		if (this.#starts.length) return this.#learned()
 
 		const settings = this.#stream?.getAudioTracks()[0]?.getSettings() as (MediaTrackSettings & { latency? : number }) | undefined
 		return (context?.baseLatency || 0) + (context?.outputLatency || 0) + (settings?.latency || 0)
@@ -197,6 +212,7 @@ class AudioController {
 			this.#ring = new Float32Array(Math.ceil(context.sampleRate * ringSeconds))
 			this.#firstFrame = -1
 			this.#floor = 0
+			this.#starts = []
 			this.#pending = []
 			this.#resetEcho()
 			this.#input = context.createMediaStreamSource(stream)
@@ -240,6 +256,7 @@ class AudioController {
 	setTempo (bpm : number) {
 		this.bpm = Math.min(240, Math.max(30, Math.round(bpm)))
 		this.tempoVersion.set(this.tempoVersion.get() + 1)
+		this.#starts = []
 		this.#resetClock()
 	}
 
@@ -394,71 +411,114 @@ class AudioController {
 		this.#written = frame + data.length
 		this.#listenEcho(ring, context.sampleRate)
 
-		// Detection hears the mic with the metronome's own echo removed.
-		const heard = this.#removeEcho(data, frame, context.sampleRate)
 		let sum = 0
-		for (const value of heard) sum += value * value
+		for (const value of data) sum += value * value
 		this.#rawLevel = Math.sqrt(sum / data.length)
 		this.#trackFloor(this.#rawLevel)
 		this.#detect(this.#rawLevel, frame / context.sampleRate, (frame + data.length) / context.sampleRate)
 	}
 
 	#resetEcho () {
-		this.#echo = null
-		this.#echoCount = 0
-		this.#echoStart = -1
+		this.#envelope = null
+		this.#envelopeCount = 0
+		this.#echoOnset = -1
+		this.#template = null
+		this.#templateCount = 0
 	}
 
-	// Folds the mic audio after every fully captured click into the echo average while
-	// nothing else is playing, then finds where the click comes back.
+	// Folds the loudness after every fully captured click into an average envelope, finds
+	// where the click comes back, and keeps a click-aligned average of the echo itself.
 	#listenEcho (ring : Float32Array, rate : number) {
 		const size = Math.round(echoWindow * rate)
-		let added = false
+		const bin = Math.round(echoBin * rate)
 		while (this.#pending.length && this.#pending[0] + size <= this.#written) {
 			const click = this.#pending.shift()!
 			if (click < this.#firstFrame || click <= this.#written - ring.length) continue
-			if (this.status.get() !== 'arming' || this.#qualified) continue
+			// Also while "recording": with a bad browser estimate the leaking clicks themselves keep
+			// the take open, and only a measured echo gets it out. Playing along averages away.
+			if (this.status.get() === 'playing') continue
 
-			const echo = this.#echo ??= new Float32Array(size)
-			const weight = 1 / Math.min(++this.#echoCount, echoDepth)
-			for (let index = 0; index < size; index++) echo[index] += (ring[(click + index) % ring.length] - echo[index]) * weight
-			added = true
+			const envelope = this.#envelope ??= new Float32Array(Math.floor(size / bin))
+			const weight = 1 / Math.min(++this.#envelopeCount, echoDepth)
+			for (let index = 0; index < envelope.length; index++) {
+				let sum = 0
+				for (let at = click + index * bin; at < click + (index + 1) * bin; at++) sum += Math.abs(ring[at % ring.length])
+				envelope[index] += (sum / bin - envelope[index]) * weight
+			}
+			if (this.#envelopeCount < 4) continue
+
+			this.#locateEcho(bin, rate)
+			if (this.#echoOnset >= 0 && this.status.get() === 'arming' && !this.#qualified) this.#learnTemplate(ring, click, rate)
 		}
-		if (added && this.#echoCount >= 4) this.#locateEcho(rate)
 	}
 
-	#locateEcho (rate : number) {
-		const echo = this.#echo!
+	#locateEcho (bin : number, rate : number) {
+		const envelope = this.#envelope!
 		let peak = 0
-		for (const value of echo) peak = Math.max(peak, Math.abs(value))
+		for (const value of envelope) peak = Math.max(peak, value)
 
-		// Robust noise floor: the click occupies a small slice of the window, so the median ignores it.
-		const sample = Array.from({ length: Math.floor(echo.length / 4) }, (_, index) => Math.abs(echo[index * 4])).sort((a, b) => a - b)
-		const noise = sample[sample.length >> 1] / .6745
-		if (!peak || peak < noise * 20) {
-			this.#echoStart = -1
+		// The click fills a small slice of the window, so the median is the room.
+		const noise = Array.from(envelope).sort((a, b) => a - b)[envelope.length >> 1]
+		const previous = this.#echoOnset
+		if (!peak || peak < noise * 6) {
+			this.#echoOnset = -1
+		} else {
+			this.#echoOnset = envelope.findIndex(value => value - noise >= (peak - noise) * .35) * bin
+		}
+
+		// A different round trip (another output, another mic) needs a fresh echo template.
+		if (this.#echoOnset < 0 || previous < 0 || Math.abs(this.#echoOnset - previous) > .005 * rate) {
+			this.#template = null
+			this.#templateCount = 0
+		}
+	}
+
+	#learnTemplate (ring : Float32Array, click : number, rate : number) {
+		const base = click + this.#echoOnset - Math.round(echoPre * rate)
+		const read = (at : number) => ring[((at % ring.length) + ring.length) % ring.length]
+		const length = Math.round((echoPre + echoLength) * rate)
+		if (!this.#template) {
+			this.#template = Float32Array.from({ length }, (_, index) => read(base + index))
+			this.#templateCount = 1
 			return
 		}
 
-		const onset = echo.findIndex(value => Math.abs(value) >= peak * .35)
-		this.#echoOnset = onset
-		this.#echoStart = Math.max(0, onset - Math.round(echoPre * rate))
+		const template = this.#template
+		const { lag } = this.#align(read, base, rate)
+		const weight = 1 / Math.min(++this.#templateCount, 16)
+		for (let index = 0; index < length; index++) template[index] += (read(base + lag + index) - template[index]) * weight
 	}
 
-	#removeEcho (data : Float32Array, frame : number, rate : number) {
-		if (!this.#echo || this.#echoStart < 0) return data
-
-		const template = this.#echo.subarray(this.#echoStart, Math.min(this.#echo.length, this.#echoStart + Math.round(echoLength * rate)))
-		const heard = data.slice()
-		for (let index = this.#clickFrames.length - 1; index >= 0; index--) {
-			const at = this.#clickFrames[index] + this.#echoStart - frame
-			if (at + template.length <= 0) break
-			if (at >= heard.length) continue
-
-			for (let position = Math.max(0, at); position < Math.min(heard.length, at + template.length); position++) heard[position] -= template[position - at]
+	// Finds where the template sits near `base`: a coarse pass on the click's attack, then a fine one.
+	#align (read : (at : number) => number, base : number, rate : number) {
+		const template = this.#template!
+		const reach = Math.round(echoJitter * rate)
+		const span = Math.min(template.length, Math.round((echoPre + alignLength) * rate))
+		const score = (lag : number) => {
+			let dot = 0
+			for (let index = 0; index < span; index++) dot += read(base + lag + index) * template[index]
+			return dot
 		}
 
-		return heard
+		let lag = 0
+		let best = -Infinity
+		for (let at = -reach; at <= reach; at += 4) {
+			const value = score(at)
+			if (value > best) {
+				best = value
+				lag = at
+			}
+		}
+		const coarse = lag
+		for (let at = coarse - 3; at <= coarse + 3; at++) {
+			const value = score(at)
+			if (value > best) {
+				best = value
+				lag = at
+			}
+		}
+
+		return { lag }
 	}
 
 	// Falls to quiet blocks at once and creeps up slowly, only while waiting for a phrase.
@@ -468,40 +528,31 @@ class AudioController {
 		this.#floor = !this.#floor || level < this.#floor ? level : this.#floor + (level - this.#floor) * .003
 	}
 
-	// Subtracts the averaged click echo at every beat inside the recording, so the phrase
-	// carries only what was played and never doubles the live metronome.
+	// Subtracts the echo template at every beat inside the recording, each one found where it
+	// actually landed, so the phrase carries only what was played and never doubles the metronome.
 	#cancelClicks (samples : Float32Array, from : number, rate : number) {
-		if (!this.#echo || this.#echoStart < 0) return
+		const template = this.#template
+		if (!template || this.#echoOnset < 0) return
 
-		const template = this.#echo.subarray(this.#echoStart, Math.min(this.#echo.length, this.#echoStart + Math.round(echoLength * rate)))
 		let power = 0
 		for (const value of template) power += value * value
 		if (!power) return
 
+		const read = (at : number) => at >= 0 && at < samples.length ? samples[at] : 0
 		for (const click of this.#clickFrames) {
-			const at = click + this.#echoStart - from
-			if (at + template.length <= 0 || at >= samples.length) continue
+			const base = click + this.#echoOnset - Math.round(echoPre * rate) - from
+			if (base + template.length <= 0 || base >= samples.length) continue
 
-			let best = 0
-			let shift = 0
-			for (let lag = -6; lag <= 6; lag++) {
-				let dot = 0
-				for (let index = 0; index < template.length; index++) {
-					const position = at + lag + index
-					if (position >= 0 && position < samples.length) dot += samples[position] * template[index]
-				}
-				if (dot > best) {
-					best = dot
-					shift = lag
-				}
-			}
+			const { lag } = this.#align(read, base, rate)
+			let dot = 0
+			for (let index = 0; index < template.length; index++) dot += read(base + lag + index) * template[index]
 
 			// The template is the click at its usual level, so a real match needs a gain near 1.
-			const gain = best / power
+			const gain = dot / power
 			if (gain < .4 || gain > 1.8) continue
 
 			for (let index = 0; index < template.length; index++) {
-				const position = at + shift + index
+				const position = base + lag + index
 				if (position >= 0 && position < samples.length) samples[position] -= gain * template[index]
 			}
 		}
@@ -509,10 +560,8 @@ class AudioController {
 
 	// Metronome clicks leak into the mic one round trip after they are scheduled.
 	#guarded (time : number) {
-		if (this.#echoStart >= 0) return false
-
 		const latency = this.latency
-		return this.#clicks.some(click => time >= click + latency - .01 && time <= click + latency + .06)
+		return this.#clicks.some(click => time >= click + latency - .015 && time <= click + latency + .1)
 	}
 
 	#detect (level : number, start : number, time : number) {
@@ -525,8 +574,12 @@ class AudioController {
 			this.#attemptAt ||= start
 
 			if (!guarded) {
-				this.#soundAt ||= time
+				if (!this.#soundAt) {
+					this.#soundAt = time
+					this.#noteAt = start
+				}
 				if (time - this.#soundAt >= .065) {
+					this.#firstNote ||= this.#noteAt
 					this.#qualified = true
 					this.#lastSoundAt = time
 					if (status !== 'recording') this.status.set('recording')
@@ -547,6 +600,8 @@ class AudioController {
 		this.#soundAt = 0
 		this.#lastSoundAt = 0
 		this.#qualified = false
+		this.#noteAt = 0
+		this.#firstNote = 0
 		if (this.status.get() === 'recording') this.status.set('arming')
 	}
 
@@ -561,6 +616,8 @@ class AudioController {
 		let from = Math.round((onset - preroll) * rate)
 		let grid = false
 		if (this.transport.get()) {
+			if (this.#echoOnset < 0) this.#learnStart(this.#attack(ring, this.#firstNote || onset, rate))
+
 			// Start the take exactly on the beat before the first note, as that beat reached the mic.
 			const latency = this.latency
 			const beat = this.beatDuration
@@ -572,10 +629,21 @@ class AudioController {
 			}
 		}
 		from = Math.max(from, earliest)
-		const to = Math.round(Math.min(time, this.#lastSoundAt + tail) * rate)
+		let to = Math.round(Math.min(time, this.#lastSoundAt + tail) * rate)
+		// A take on the grid also ends on a beat: whole beats from the one before the first note.
+		if (grid) {
+			const beat = this.beatDuration * rate
+			to = Math.min(Math.round(time * rate), from + Math.round(Math.ceil((to - from) / beat) * beat))
+		}
 		const samples = new Float32Array(Math.max(1, to - from))
 		for (let index = 0; index < samples.length; index++) samples[index] = ring[(from + index) % ring.length]
 		this.#cancelClicks(samples, from, rate)
+
+		// A take opened by leaking clicks before the echo was measured is empty once they are removed.
+		if (!this.#audible(samples)) {
+			this.#resetAttempt()
+			return
+		}
 
 		const buffer = context.createBuffer(1, samples.length, rate)
 		buffer.copyToChannel(samples, 0)
@@ -584,6 +652,50 @@ class AudioController {
 		this.#resetAttempt()
 		this.phrase.set(phrase)
 		void this.#play(phrase)
+	}
+
+	// Pins the first note to the 64-sample window where it crosses the gate.
+	#attack (ring : Float32Array, near : number, rate : number) {
+		const gate = this.gate
+		const center = Math.round(near * rate)
+		for (let start = center - 1024; start < center + 512; start += 64) {
+			let sum = 0
+			for (let index = start; index < start + 64; index++) sum += ring[((index % ring.length) + ring.length) % ring.length] ** 2
+			if (Math.sqrt(sum / 64) >= gate) return start / rate
+		}
+
+		return near
+	}
+
+	#learnStart (note : number) {
+		const beat = this.beatDuration
+		this.#starts.push((((note - this.#origin) % beat) + beat) % beat)
+		this.#starts = this.#starts.slice(-5)
+	}
+
+	// Circular mean over the beat, so starts just before and just after it average correctly.
+	#learned () {
+		const beat = this.beatDuration
+		let x = 0
+		let y = 0
+		for (const start of this.#starts) {
+			x += Math.cos(start / beat * 2 * Math.PI)
+			y += Math.sin(start / beat * 2 * Math.PI)
+		}
+		const angle = Math.atan2(y, x)
+
+		return (angle < 0 ? angle + 2 * Math.PI : angle) / (2 * Math.PI) * beat
+	}
+
+	#audible (samples : Float32Array) {
+		const gate = this.gate
+		for (let start = 0; start + 512 <= samples.length; start += 512) {
+			let sum = 0
+			for (let index = start; index < start + 512; index++) sum += samples[index] * samples[index]
+			if (Math.sqrt(sum / 512) >= gate) return true
+		}
+
+		return false
 	}
 
 	#peaks (samples : Float32Array) {

@@ -325,11 +325,13 @@ class MirrorPage extends SignalWatcher(LitElement) {
 						`)}
 					</div>
 				</fieldset>
+
+				<span class=version>${__VERSION__}</span>
 			</div>
 		`
 	}
 
-	#bars (values : number[], progress? : number) {
+		#bars (values : number[], progress? : number) {
 		return html`
 			<span class=bars aria-hidden=true>
 				${values.map((value, index) => html`<span class=${progress !== undefined && index / values.length >= progress ? 'bar ahead' : 'bar'} style=${`--h: ${value}`}></span>`)}

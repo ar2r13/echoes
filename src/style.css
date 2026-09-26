@@ -532,6 +532,13 @@
 		color: var(--fg-muted);
 	}
 
+	.version {
+		font-family: var(--font-mono);
+		font-size: .625rem;
+		color: var(--fg-faint);
+		user-select: all;
+	}
+
 	.meta {
 		font-family: var(--font-mono);
 		font-size: .75rem;

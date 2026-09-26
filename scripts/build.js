@@ -1,10 +1,11 @@
 import { build, context } from 'esbuild'
-import { cp, mkdir, rm } from 'node:fs/promises'
+import { cp, mkdir, readFile, rm } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)))
 const serving = process.argv.includes('--serve')
+const { version } = JSON.parse(await readFile(`${root}/package.json`, 'utf8'))
 
 await rm(`${root}/www`, { recursive: true, force: true })
 await mkdir(`${root}/www`, { recursive: true })
@@ -27,6 +28,7 @@ const options = {
 	splitting: true,
 	outdir: `${root}/www`,
 	target: 'es2022',
+	define: { __VERSION__: JSON.stringify(version) },
 	minify: !serving,
 	sourcemap: serving
 }

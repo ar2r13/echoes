@@ -1,3 +1,5 @@
+declare const __VERSION__ : string
+
 interface Document {
 	modelContext?: {
 		registerTool(tool : {
