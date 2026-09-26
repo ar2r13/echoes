@@ -2,12 +2,16 @@ import { Signal } from '@lit-labs/signals'
 
 export type MirrorStatus = 'idle' | 'requesting' | 'arming' | 'recording' | 'playing' | 'error'
 export type ClickSound = 'click' | 'woodblock' | 'hihat'
+type Settings = { bpm : number, defaultBpm? : number, silenceBeats : number, threshold : number, sound : ClickSound, volume : number, metronomeVolume? : number, bufferSeconds? : number }
 // `onset` is where the first note sits in `buffer`. When `grid` is set, sample 0 of `buffer`
 // is a metronome beat as it reached the mic, so starting it on a beat keeps it in time.
 export type Phrase = { buffer : AudioBuffer, peaks : number[], duration : number, onset : number, grid : boolean }
 
 const peakCount = 48
-const ringSeconds = 60
+export const bufferOptions = [30, 60, 120, 300]
+const recordingWarningSeconds = 30
+// The ring holds a little more than the longest take, for the preroll before its first note.
+const ringMargin = 1
 const preroll = .25
 const tail = .35
 const lead = .05
@@ -21,6 +25,46 @@ const echoDepth = 24
 const echoBin = .001
 const echoJitter = .012
 const alignLength = .02
+const settingsKey = 'echo-settings'
+// First one the browser can record wins: Opus where possible, AAC on Safari.
+const recorderTypes = ['audio/webm;codecs=opus', 'audio/ogg;codecs=opus', 'audio/mp4']
+const microphone = { autoGainControl: false, echoCancellation: false, noiseSuppression: false }
+
+// Loudest sample in each of `peakCount` slices, scaled so the loudest slice is 1.
+const measure = (samples : Float32Array) => {
+	const size = Math.max(1, Math.floor(samples.length / peakCount))
+	const peaks = Array.from({ length: peakCount }, (_, index) => {
+		let peak = 0
+		for (let at = index * size; at < Math.min(samples.length, (index + 1) * size); at++) peak = Math.max(peak, Math.abs(samples[at]))
+		return peak
+	})
+	const top = Math.max(...peaks) || 1
+
+	return peaks.map(value => value / top)
+}
+
+// 16-bit mono WAV, so a phrase saves exactly as it was heard.
+export const wav = (buffer : AudioBuffer) => {
+	const samples = buffer.getChannelData(0)
+	const rate = buffer.sampleRate
+	const view = new DataView(new ArrayBuffer(44 + samples.length * 2))
+	const text = (at : number, value : string) => [...value].forEach((char, index) => view.setUint8(at + index, char.charCodeAt(0)))
+	text(0, 'RIFF')
+	view.setUint32(4, 36 + samples.length * 2, true)
+	text(8, 'WAVEfmt ')
+	view.setUint32(16, 16, true)
+	view.setUint16(20, 1, true)
+	view.setUint16(22, 1, true)
+	view.setUint32(24, rate, true)
+	view.setUint32(28, rate * 2, true)
+	view.setUint16(32, 2, true)
+	view.setUint16(34, 16, true)
+	text(36, 'data')
+	view.setUint32(40, samples.length * 2, true)
+	samples.forEach((value, index) => view.setInt16(44 + index * 2, Math.max(-1, Math.min(1, value)) * 0x7fff, true))
+
+	return new Blob([view], { type: 'audio/wav' })
+}
 
 // Posts mono mic blocks tagged with the context frame they were rendered at,
 // so every recorded sample has an exact position on the metronome's clock.
@@ -61,16 +105,24 @@ class AudioController {
 	readonly error = new Signal.State('')
 	readonly mic = new Signal.State(false)
 	readonly beat = new Signal.State(0)
+	readonly recordingSecondsLeft = new Signal.State(0)
 	// Taps in the current tap-tempo run; drops to 0 once the run times out.
 	readonly taps = new Signal.State(0)
 	// Every tap ever, so the UI can restart its press animation.
 	readonly tapped = new Signal.State(0)
+	// When the plain recorder started (performance.now()), or 0 while it is off.
+	readonly recorder = new Signal.State(0)
+	// Id of the saved recording playing now.
+	readonly saved = new Signal.State<string | null>(null)
 
-	bpm = 92
-	silenceBeats = 2
-	threshold = .055
+	bpm = 60
+	#defaultBpm = 60
+	#silenceBeats = 2
+	#threshold = .055
 	#sound : ClickSound = 'click'
 	#volume = .8
+	#metronomeVolume = 1
+	#bufferSeconds = 120
 
 	#context : AudioContext | null = null
 	#stream : MediaStream | null = null
@@ -100,7 +152,7 @@ class AudioController {
 	#source : AudioBufferSourceNode | null = null
 	#gain : GainNode | null = null
 	#playStart = 0
-	#noise : AudioBuffer | null = null
+	#hat : AudioBuffer | null = null
 	#session = 0
 	#clickFrames : number[] = []
 	#pending : number[] = []
@@ -113,9 +165,51 @@ class AudioController {
 	#echoOnset = -1
 	#template : Float32Array | null = null
 	#templateCount = 0
+	#recording : { recorder : MediaRecorder, chunks : Blob[] } | null = null
+	#recorderSession = 0
+	#savedSource : AudioBufferSourceNode | null = null
+	#savedGain : GainNode | null = null
+	#decoded : { id : string, buffer : AudioBuffer } | null = null
+
+	constructor () {
+		const stored = localStorage.getItem(settingsKey)
+		if (!stored) return
+
+		const settings = JSON.parse(stored) as Settings
+		this.bpm = settings.bpm
+		this.#defaultBpm = settings.defaultBpm ?? 60
+		this.#silenceBeats = settings.silenceBeats
+		this.#threshold = settings.threshold
+		this.#sound = settings.sound
+		this.#volume = settings.volume
+		this.#metronomeVolume = settings.metronomeVolume ?? 1
+		if (bufferOptions.includes(settings.bufferSeconds!)) this.#bufferSeconds = settings.bufferSeconds!
+	}
 
 	get mirrorRunning () {
 		return this.mic.get()
+	}
+
+	// Longest phrase that can be captured. The mic's ring buffer is sized to it.
+	get bufferSeconds () {
+		return this.#bufferSeconds
+	}
+
+	set bufferSeconds (value : number) {
+		if (value === this.#bufferSeconds) return
+		this.#bufferSeconds = value
+		this.#saveSettings()
+		if (!this.#ring || !this.#context) return
+
+		// A take in progress lives in the old ring; drop it rather than cut it.
+		this.#ring = this.#newRing(this.#context)
+		this.#resetAttempt()
+	}
+
+	#newRing (context : AudioContext) {
+		this.#firstFrame = -1
+		this.#pending = []
+		return new Float32Array(Math.ceil(context.sampleRate * (this.#bufferSeconds + ringMargin)))
 	}
 
 	get beatDuration () {
@@ -130,6 +224,35 @@ class AudioController {
 		if (value === this.#sound) return
 		this.#sound = value
 		this.#resetEcho()
+		this.#saveSettings()
+	}
+
+	// Where the reset button takes the tempo.
+	get defaultBpm () {
+		return this.#defaultBpm
+	}
+
+	set defaultBpm (value : number) {
+		this.#defaultBpm = Math.min(240, Math.max(30, Math.round(value)))
+		this.#saveSettings()
+	}
+
+	get silenceBeats () {
+		return this.#silenceBeats
+	}
+
+	set silenceBeats (value : number) {
+		this.#silenceBeats = value
+		this.#saveSettings()
+	}
+
+	get threshold () {
+		return this.#threshold
+	}
+
+	set threshold (value : number) {
+		this.#threshold = value
+		this.#saveSettings()
 	}
 
 	// The threshold actually applied: never below what the quiet room already measures.
@@ -144,6 +267,17 @@ class AudioController {
 	set volume (value : number) {
 		this.#volume = Math.min(1, Math.max(0, value))
 		if (this.#gain) this.#gain.gain.value = this.#volume
+		if (this.#savedGain) this.#savedGain.gain.value = this.#volume
+		this.#saveSettings()
+	}
+
+	get metronomeVolume () {
+		return this.#metronomeVolume
+	}
+
+	set metronomeVolume (value : number) {
+		this.#metronomeVolume = Math.min(1, Math.max(0, value))
+		this.#saveSettings()
 	}
 
 	get progress () {
@@ -194,13 +328,7 @@ class AudioController {
 			const context = await this.#getContext()
 			this.#tapReady ??= context.audioWorklet.addModule(URL.createObjectURL(new Blob([tapSource], { type: 'text/javascript' })))
 			const [stream] = await Promise.all([
-				navigator.mediaDevices.getUserMedia({
-					audio: {
-						autoGainControl: false,
-						echoCancellation: false,
-						noiseSuppression: false
-					}
-				}),
+				navigator.mediaDevices.getUserMedia({ audio: microphone }),
 				this.#tapReady
 			])
 			if (session !== this.#session) {
@@ -209,11 +337,9 @@ class AudioController {
 			}
 
 			this.#stream = stream
-			this.#ring = new Float32Array(Math.ceil(context.sampleRate * ringSeconds))
-			this.#firstFrame = -1
+			this.#ring = this.#newRing(context)
 			this.#floor = 0
 			this.#starts = []
-			this.#pending = []
 			this.#resetEcho()
 			this.#input = context.createMediaStreamSource(stream)
 			this.#tap = new AudioWorkletNode(context, 'echo-tap', { channelCount: 1, channelCountMode: 'explicit', numberOfOutputs: 1 })
@@ -228,12 +354,114 @@ class AudioController {
 		} catch (error) {
 			if (session !== this.#session) return
 
-			this.error.set(error instanceof DOMException && error.name === 'NotAllowedError'
-				? 'Microphone access is blocked. Allow it in your browser settings.'
-				: 'Could not start the microphone. Check your audio device and try again.')
-			this.status.set('error')
+			this.#fail(error)
 			this.#releaseMirror()
 		}
+	}
+
+	#fail (error : unknown) {
+		this.error.set(error instanceof DOMException && error.name === 'NotAllowedError'
+			? 'Microphone access is blocked. Allow it in your browser settings.'
+			: 'Could not start the microphone. Check your audio device and try again.')
+		this.status.set('error')
+	}
+
+	// Records the mic as it is, like a voice recorder, until stopRecorder(). Echo stops meanwhile.
+	async startRecorder () {
+		if (this.recorder.get()) return
+
+		const session = ++this.#recorderSession
+		this.stopMirror()
+		this.stopSaved()
+		this.error.set('')
+		this.recorder.set(performance.now())
+		try {
+			const stream = await navigator.mediaDevices.getUserMedia({ audio: microphone })
+			if (session !== this.#recorderSession) {
+				stream.getTracks().forEach(track => track.stop())
+				return
+			}
+
+			const type = recorderTypes.find(type => MediaRecorder.isTypeSupported(type))
+			const recorder = new MediaRecorder(stream, type ? { mimeType: type } : {})
+			const chunks : Blob[] = []
+			recorder.addEventListener('dataavailable', event => chunks.push(event.data))
+			recorder.start()
+			this.#recording = { recorder, chunks }
+			// The clock counts from when the mic actually opened.
+			this.recorder.set(performance.now())
+		} catch (error) {
+			if (session !== this.#recorderSession) return
+
+			this.recorder.set(0)
+			this.#fail(error)
+		}
+	}
+
+	// Stops the recorder and returns the take, or null when nothing was captured.
+	async stopRecorder () {
+		const recording = this.#recording
+		const started = this.recorder.get()
+		this.#recorderSession++
+		this.#recording = null
+		this.recorder.set(0)
+		if (!recording) return null
+
+		const { recorder, chunks } = recording
+		const stopped = new Promise(resolve => recorder.addEventListener('stop', resolve, { once: true }))
+		recorder.stop()
+		await stopped
+		recorder.stream.getTracks().forEach(track => track.stop())
+		const blob = new Blob(chunks, { type: recorder.mimeType })
+		if (!blob.size) return null
+
+		try {
+			const context = await this.#getContext()
+			const buffer = await context.decodeAudioData(await blob.arrayBuffer())
+			return { blob, duration: buffer.duration, peaks: measure(buffer.getChannelData(0)) }
+		} catch {
+			return { blob, duration: (performance.now() - started) / 1000, peaks: [] }
+		}
+	}
+
+	async playSaved (id : string, load : () => Promise<Blob>) {
+		this.stopSaved()
+		this.#stopPlayback()
+		if (this.status.get() === 'playing') this.status.set(this.#stream ? 'arming' : 'idle')
+		this.#resetAttempt()
+		this.saved.set(id)
+		try {
+			const context = await this.#getContext()
+			const buffer = this.#decoded?.id === id ? this.#decoded.buffer : await context.decodeAudioData(await (await load()).arrayBuffer())
+			this.#decoded = { id, buffer }
+			// Another take was started, or this one stopped, while it decoded.
+			if (this.saved.get() !== id) return
+
+			const source = context.createBufferSource()
+			const gain = context.createGain()
+			source.buffer = buffer
+			gain.gain.value = this.#volume
+			source.connect(gain).connect(context.destination)
+			source.addEventListener('ended', () => {
+				if (this.#savedSource === source) this.stopSaved()
+			}, { once: true })
+			source.start()
+			this.#savedSource = source
+			this.#savedGain = gain
+		} catch {
+			if (this.saved.get() === id) this.saved.set(null)
+		}
+	}
+
+	stopSaved () {
+		const source = this.#savedSource
+		this.#savedSource = null
+		this.#savedGain = null
+		this.saved.set(null)
+		try {
+			source?.stop()
+		} catch {}
+		source?.disconnect()
 	}
 
 	stopMirror () {
@@ -248,6 +476,8 @@ class AudioController {
 	dispose () {
 		this.stopTransport()
 		this.stopMirror()
+		this.stopSaved()
+		void this.stopRecorder()
 		void this.#context?.close()
 		this.#context = null
 		this.#tapReady = null
@@ -257,7 +487,21 @@ class AudioController {
 		this.bpm = Math.min(240, Math.max(30, Math.round(bpm)))
 		this.tempoVersion.set(this.tempoVersion.get() + 1)
 		this.#starts = []
-		this.#resetClock()
+		if (this.transport.get()) this.#origin = this.#nextBeat
+		this.#saveSettings()
+	}
+
+	#saveSettings () {
+		localStorage.setItem(settingsKey, JSON.stringify({
+			bpm: this.bpm,
+			defaultBpm: this.defaultBpm,
+			silenceBeats: this.silenceBeats,
+			threshold: this.threshold,
+			sound: this.sound,
+			volume: this.volume,
+			metronomeVolume: this.metronomeVolume,
+			bufferSeconds: this.bufferSeconds
+		} satisfies Settings))
 	}
 
 	tapTempo () {
@@ -279,11 +523,28 @@ class AudioController {
 	}
 
 	async tick () {
+		navigator.vibrate?.(8)
 		const context = await this.#getContext()
-		this.#click(context.currentTime + .005, false)
+		const time = context.currentTime + .005
+		const oscillator = context.createOscillator()
+		const gain = context.createGain()
+		oscillator.type = 'sine'
+		oscillator.frequency.value = 980
+		gain.gain.setValueAtTime(0, time)
+		gain.gain.linearRampToValueAtTime(.35 * this.metronomeVolume, time + .002)
+		gain.gain.exponentialRampToValueAtTime(.0001, time + .045)
+		oscillator.connect(gain).connect(context.destination)
+		oscillator.start(time)
+		oscillator.stop(time + .05)
 	}
 
 	playLast () {
+		if (this.status.get() === 'playing') {
+			this.#stopPlayback()
+			this.status.set(this.#stream ? 'arming' : 'idle')
+			return
+		}
+
 		const phrase = this.phrase.get()
 		if (phrase) void this.#play(phrase)
 	}
@@ -291,6 +552,7 @@ class AudioController {
 	async #getContext () {
 		this.#context ??= new AudioContext({ latencyHint: 'interactive' })
 		if (this.#context.state !== 'running') await this.#context.resume()
+		this.#hat ??= await this.#context.decodeAudioData(await (await fetch('/hat.wav')).arrayBuffer())
 
 		return this.#context
 	}
@@ -309,12 +571,6 @@ class AudioController {
 		this.#sink = null
 		this.#ring = null
 		this.mic.set(false)
-	}
-
-	#resetClock () {
-		if (!this.#context || !this.transport.get()) return
-
-		this.#nextBeat = this.#origin = this.#context.currentTime + .08
 	}
 
 	#schedule () {
@@ -342,7 +598,7 @@ class AudioController {
 			this.#clicks.push(time)
 			this.#clicks = this.#clicks.filter(click => click > time - 2)
 			this.#clickFrames.push(frame)
-			this.#clickFrames = this.#clickFrames.filter(click => click > frame - ringSeconds * context.sampleRate)
+			this.#clickFrames = this.#clickFrames.filter(click => click > frame - (this.#bufferSeconds + ringMargin) * context.sampleRate)
 			if (this.#ring) this.#pending.push(frame)
 		}
 
@@ -350,18 +606,11 @@ class AudioController {
 		gain.connect(context.destination)
 
 		if (this.sound === 'hihat') {
-			this.#noise ??= this.#createNoise(context)
 			const source = context.createBufferSource()
-			const filter = context.createBiquadFilter()
-			source.buffer = this.#noise
-			filter.type = 'highpass'
-			filter.frequency.value = 7000
-			gain.gain.setValueAtTime(0, time)
-			gain.gain.linearRampToValueAtTime(.35, time + .001)
-			gain.gain.exponentialRampToValueAtTime(.0001, time + .05)
-			source.connect(filter).connect(gain)
+			source.buffer = this.#hat
+			gain.gain.setValueAtTime(this.metronomeVolume, time)
+			source.connect(gain)
 			source.start(time)
-			source.stop(time + .06)
 
 			return
 		}
@@ -371,19 +620,11 @@ class AudioController {
 		oscillator.type = woodblock ? 'triangle' : 'sine'
 		oscillator.frequency.value = woodblock ? 1250 : 980
 		gain.gain.setValueAtTime(0, time)
-		gain.gain.linearRampToValueAtTime(woodblock ? .4 : .28, time + .002)
+		gain.gain.linearRampToValueAtTime((woodblock ? .9 : 1) * this.metronomeVolume, time + .002)
 		gain.gain.exponentialRampToValueAtTime(.0001, time + (woodblock ? .03 : .045))
 		oscillator.connect(gain)
 		oscillator.start(time)
 		oscillator.stop(time + .05)
-	}
-
-	#createNoise (context : AudioContext) {
-		const buffer = context.createBuffer(1, Math.ceil(context.sampleRate * .06), context.sampleRate)
-		const data = buffer.getChannelData(0)
-		for (let index = 0; index < data.length; index++) data[index] = Math.random() * 2 - 1
-
-		return buffer
 	}
 
 	#watchLevel () {
@@ -434,9 +675,11 @@ class AudioController {
 		while (this.#pending.length && this.#pending[0] + size <= this.#written) {
 			const click = this.#pending.shift()!
 			if (click < this.#firstFrame || click <= this.#written - ring.length) continue
-			// Also while "recording": with a bad browser estimate the leaking clicks themselves keep
-			// the take open, and only a measured echo gets it out. Playing along averages away.
-			if (this.status.get() === 'playing') continue
+			// Loudness never averages away, so playing would bury the clicks: measure between phrases.
+			// Until a first measurement exists, also measure during a take, since with a bad browser
+			// estimate the leaking clicks themselves can keep it open.
+			const quiet = this.status.get() === 'arming' && !this.#qualified
+			if (this.status.get() === 'playing' || this.saved.get() || (!quiet && this.#echoOnset >= 0)) continue
 
 			const envelope = this.#envelope ??= new Float32Array(Math.floor(size / bin))
 			const weight = 1 / Math.min(++this.#envelopeCount, echoDepth)
@@ -448,7 +691,7 @@ class AudioController {
 			if (this.#envelopeCount < 4) continue
 
 			this.#locateEcho(bin, rate)
-			if (this.#echoOnset >= 0 && this.status.get() === 'arming' && !this.#qualified) this.#learnTemplate(ring, click, rate)
+			if (this.#echoOnset >= 0 && quiet) this.#learnTemplate(ring, click, rate)
 		}
 	}
 
@@ -567,6 +810,8 @@ class AudioController {
 	#detect (level : number, start : number, time : number) {
 		const status = this.status.get()
 		if (status !== 'arming' && status !== 'recording') return
+		// A saved take playing through the speakers is not a phrase.
+		if (this.saved.get()) return
 
 		const sounding = level >= this.gate
 		const guarded = this.#guarded(time)
@@ -592,7 +837,17 @@ class AudioController {
 			if (this.#attemptAt && !this.#qualified && !guarded && time - this.#attemptAt >= .12) this.#resetAttempt()
 		}
 
-		if (this.#qualified && time - this.#lastSoundAt >= this.silenceBeats * this.beatDuration) this.#finish(time)
+		if (this.#qualified) {
+			const remaining = this.#bufferSeconds - (time - (this.#firstNote || this.#attemptAt))
+			// Short buffers warn for their last third only, so the countdown isn't always on.
+			const warning = Math.min(recordingWarningSeconds, this.#bufferSeconds / 3)
+			this.recordingSecondsLeft.set(remaining <= warning ? Math.max(0, Math.ceil(remaining)) : 0)
+			if (remaining <= 0) {
+				this.#finish(time)
+				return
+			}
+			if (time - this.#lastSoundAt >= this.silenceBeats * this.beatDuration) this.#finish(time)
+		}
 	}
 
 	#resetAttempt () {
@@ -602,6 +857,7 @@ class AudioController {
 		this.#qualified = false
 		this.#noteAt = 0
 		this.#firstNote = 0
+		this.recordingSecondsLeft.set(0)
 		if (this.status.get() === 'recording') this.status.set('arming')
 	}
 
@@ -647,7 +903,7 @@ class AudioController {
 
 		const buffer = context.createBuffer(1, samples.length, rate)
 		buffer.copyToChannel(samples, 0)
-		const phrase = { buffer, peaks: this.#peaks(samples), duration: buffer.duration, onset: onset - from / rate, grid }
+		const phrase = { buffer, peaks: measure(samples), duration: buffer.duration, onset: onset - from / rate, grid }
 
 		this.#resetAttempt()
 		this.phrase.set(phrase)
@@ -698,22 +954,11 @@ class AudioController {
 		return false
 	}
 
-	#peaks (samples : Float32Array) {
-		const size = Math.max(1, Math.floor(samples.length / peakCount))
-		const peaks = Array.from({ length: peakCount }, (_, index) => {
-			let peak = 0
-			for (let at = index * size; at < Math.min(samples.length, (index + 1) * size); at++) peak = Math.max(peak, Math.abs(samples[at]))
-			return peak
-		})
-		const top = Math.max(...peaks) || 1
-
-		return peaks.map(value => value / top)
-	}
-
 	// A take that starts on a beat is started on the next live beat, so everything in it
 	// keeps the position against the metronome it was played at.
 	async #play (phrase : Phrase) {
 		const context = await this.#getContext()
+		this.stopSaved()
 		this.#stopPlayback()
 		this.#resetAttempt()
 		this.status.set('playing')

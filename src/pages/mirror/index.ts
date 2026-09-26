@@ -2,12 +2,14 @@ import { SignalWatcher } from '@lit-labs/signals'
 import { LitElement, html } from 'lit'
 import { customElement } from 'lit/decorators.js'
 import { keyed } from 'lit/directives/keyed.js'
-import { audio, type ClickSound } from '../../controllers/audio.ts'
+import { audio, bufferOptions, wav, type ClickSound, type Phrase } from '../../controllers/audio.ts'
+import { recordings, type Recording } from '../../controllers/recordings.ts'
 import '../../components/bpm-wheel.ts'
 
 type Mode = 'off' | 'listen' | 'repeat'
 
 const endings = [{ beats: 2, label: '2 beats' }, { beats: 4, label: '1 bar' }, { beats: 8, label: '2 bars' }]
+const buffers = bufferOptions.map(seconds => ({ seconds, label: seconds < 60 ? `${seconds} s` : `${seconds / 60} min` }))
 const sounds : { value : ClickSound, label : string }[] = [{ value: 'click', label: 'Click' }, { value: 'woodblock', label: 'Woodblock' }, { value: 'hihat', label: 'Hi-hat' }]
 
 const icons = {
@@ -15,8 +17,35 @@ const icons = {
 	pause: html`<svg viewBox='0 0 24 24' aria-hidden=true><rect x=6 y=5 width=4 height=14 rx=1.5 fill=currentColor></rect><rect x=14 y=5 width=4 height=14 rx=1.5 fill=currentColor></rect></svg>`,
 	sliders: html`<svg viewBox='0 0 24 24' aria-hidden=true class=stroke><path d='M4 7h10M18 7h2M4 17h4M12 17h8'></path><circle cx=16 cy=7 r=2></circle><circle cx=10 cy=17 r=2></circle></svg>`,
 	repeat: html`<svg viewBox='0 0 24 24' aria-hidden=true class=stroke><path d='M17 2l3 3-3 3'></path><path d='M4 11V9a4 4 0 0 1 4-4h12'></path><path d='M7 22l-3-3 3-3'></path><path d='M20 13v2a4 4 0 0 1-4 4H4'></path></svg>`,
-	mic: html`<svg viewBox='0 0 24 24' aria-hidden=true class=stroke><rect x=9 y=3 width=6 height=11 rx=3></rect><path d='M5 11a7 7 0 0 0 14 0'></path><path d='M12 18v3'></path></svg>`
+	mic: html`<svg viewBox='0 0 24 24' aria-hidden=true class=stroke><rect x=9 y=3 width=6 height=11 rx=3></rect><path d='M5 11a7 7 0 0 0 14 0'></path><path d='M12 18v3'></path></svg>`,
+	reset: html`<svg viewBox='0 0 24 24' aria-hidden=true class=stroke><path d='M3 12a9 9 0 1 0 3-6.7'></path><path d='M3 4v5h5'></path></svg>`,
+	chevron: html`<svg viewBox='0 0 24 24' aria-hidden=true class='stroke chevron'><path d='M6 9l6 6 6-6'></path></svg>`,
+	next: html`<svg viewBox='0 0 24 24' aria-hidden=true class=stroke><path d='M9 6l6 6-6 6'></path></svg>`,
+	bookmark: html`<svg viewBox='0 0 24 24' aria-hidden=true class=stroke><path d='M6 3h12v18l-6-4-6 4z'></path></svg>`,
+	bookmarked: html`<svg viewBox='0 0 24 24' aria-hidden=true class='stroke filled'><path d='M6 3h12v18l-6-4-6 4z'></path></svg>`,
+	close: html`<svg viewBox='0 0 24 24' aria-hidden=true class=stroke><path d='M6 6l12 12M18 6L6 18'></path></svg>`,
+	search: html`<svg viewBox='0 0 24 24' aria-hidden=true class=stroke><circle cx=11 cy=11 r=7></circle><path d='M20 20l-4-4'></path></svg>`,
+	trash: html`<svg viewBox='0 0 24 24' aria-hidden=true class=stroke><path d='M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3'></path></svg>`,
+	check: html`<svg viewBox='0 0 24 24' aria-hidden=true class=stroke><path d='M5 12.5l4.5 4.5L19 7.5'></path></svg>`
 }
+
+type Notice = { heading : string, detail : string, pill : string, failed? : boolean }
+
+const clock = (seconds : number) => `${Math.floor(seconds / 60)}:${String(Math.floor(seconds % 60)).padStart(2, '0')}`
+const timeFormat = new Intl.DateTimeFormat('en-GB', { hour: '2-digit', minute: '2-digit' })
+const dayFormat = new Intl.DateTimeFormat('en-US', { weekday: 'short', month: 'short', day: 'numeric' })
+const dateFormat = new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric' })
+
+const daysAgo = (at : number) => Math.round((new Date().setHours(0, 0, 0, 0) - new Date(at).setHours(0, 0, 0, 0)) / 864e5)
+const day = (at : number) => ['Today', 'Yesterday'][daysAgo(at)] ?? dayFormat.format(at)
+const time = (at : number) => timeFormat.format(at)
+
+// Quick tempo changes under the wheel: half time, double time and a 4/4 → 3/4 metric modulation.
+const shifts = [
+	{ factor: 1 / 2, label: '½×', name: 'Half time' },
+	{ factor: 2, label: '2×', name: 'Double time' },
+	{ factor: 3 / 4, label: '4→3', name: 'Metric modulation 4/4 to 3/4' }
+]
 
 const resample = (values : number[], count : number) => Array.from({ length: count }, (_, index) => values[Math.floor(index * values.length / count)] ?? 0)
 
@@ -28,6 +57,14 @@ class MirrorPage extends SignalWatcher(LitElement) {
 	#history : number[] = Array(60).fill(0)
 	#sampledAt = 0
 	#recordedAt = 0
+	#settingsOpen = false
+	#libraryOpen = false
+	#query = ''
+	#savedPhrase : Phrase | null = null
+	#notice : Notice | null = null
+	#noticeTimer = 0
+	#deleted : { recording : Recording, blob : Blob } | null = null
+	#deletedTimer = 0
 	#resize = () => this.requestUpdate()
 	#keyboard = (event : KeyboardEvent) => {
 		if (event.altKey || event.ctrlKey || event.metaKey) return
@@ -35,10 +72,12 @@ class MirrorPage extends SignalWatcher(LitElement) {
 		if (target?.matches('input:not([type=range]), textarea, select') || target?.isContentEditable) return
 
 		const actions : Record<string, () => void> = {
-			Space: () => this.#toggleMetronome(),
-			KeyR: () => this.#toggleEcho(),
+			Space: () => this.#toggleAll(),
+			KeyE: () => this.#toggleEcho(),
+			KeyM: () => this.#toggleMetronome(),
 			KeyT: () => audio.tapTempo(),
-			KeyL: () => audio.playLast()
+			KeyL: () => audio.playLast(),
+			KeyR: () => void this.#toggleRecorder()
 		}
 		const action = actions[event.code]
 		if (!action) return
@@ -69,6 +108,8 @@ class MirrorPage extends SignalWatcher(LitElement) {
 		window.removeEventListener('keyup', this.#release)
 		this.#wide.removeEventListener('change', this.#resize)
 		cancelAnimationFrame(this.#frame)
+		clearTimeout(this.#noticeTimer)
+		clearTimeout(this.#deletedTimer)
 		this.#tools?.abort()
 		audio.dispose()
 		super.disconnectedCallback()
@@ -96,64 +137,71 @@ class MirrorPage extends SignalWatcher(LitElement) {
 		const mode = this.#mode
 		const current = audio.status.get()
 		const phrase = audio.phrase.get()
+		const recordingSecondsLeft = audio.recordingSecondsLeft.get()
+		const recording = Boolean(audio.recorder.get())
+		const count = recordings.list.get().length
+		const title = this.#replaying ? 'Last phrase' : { off: 'Echo', listen: 'Listening', repeat: 'Playing back' }[mode]
 		const text = current === 'error'
 			? audio.error.get()
-			: this.#replaying ? 'Playing last phrase' : { off: 'Off', listen: current === 'requesting' ? 'Connecting the mic…' : 'Play — I’ll repeat after the pause', repeat: 'Mic paused' }[mode]
-		const panel = mode === 'listen'
-			? html`
-				<div class='phrase listen'>
-					<span class=blink></span>
-					<span>${current === 'recording' ? 'Recording' : 'Listening'}</span>
-					${this.#bars(this.#history.slice(-30))}
-				</div>`
-			: mode === 'repeat'
-				? html`
-					<div class='phrase repeat'>
-						${icons.repeat}
-						<span>Playing back</span>
-						${this.#bars(resample(phrase?.peaks ?? [], 30), audio.progress)}
-					</div>`
-				: html`<p class='phrase hint'>Turn it on and play — after a pause, your phrase plays back in time.</p>`
+			: recording ? 'Paused while recording' : this.#replaying ? 'Mic paused' : {
+				off: 'Tap, then play a phrase',
+				listen: current === 'requesting' ? 'Connecting the mic…' : current === 'recording' ? recordingSecondsLeft ? `Recording ends in ${recordingSecondsLeft}s` : 'Recording' : 'Pause and I’ll echo it',
+				repeat: 'Mic paused'
+			}[mode]
+		const badge = { off: icons.mic, listen: html`<span class=blink></span>`, repeat: icons.repeat }[mode]
+		const wave = mode === 'listen'
+			? this.#bars(this.#history.slice(-24))
+			: mode === 'repeat' ? this.#bars(resample(phrase?.peaks ?? [], 24), audio.progress) : this.#bars(Array(24).fill(0))
+		const notice = this.#notice
 
 		return html`
 			<main class='page mobile'>
 				<header class=top>
-					<h1>Echo</h1>
-					<button class='icon-button' aria-label=Settings @click=${this.#openSettings}>${icons.sliders}</button>
+					<h1>Echo <span class=version>${__VERSION__}</span></h1>
+					<div class=actions>
+						<button class=button aria-label=${`All recordings, ${count}`} @click=${this.#openLibrary}>${icons.bookmark}${count}</button>
+						<button class='icon-button' aria-label=Settings @click=${this.#openSettings}>${icons.sliders}</button>
+					</div>
 				</header>
 
+				${notice ? this.#toast(notice.heading, notice.detail, notice.failed ? 'trash' : 'check', notice.failed ? undefined : { label: 'Open', run: () => this.#openLibrary() }) : ''}
+
 				<section class=stage aria-label=Metronome>
-					${this.#pulse()}
-					<bpm-wheel .value=${audio.bpm} @change=${this.#wheel}></bpm-wheel>
+					${this.#dial()}
+					${this.#tempoBar()}
 					${this.#transport()}
 				</section>
 
-				<section class=${`repeat-card ${mode}`} aria-live=polite>
-					<button class=repeat-toggle aria-pressed=${audio.mic.get()} aria-keyshortcuts=R @click=${this.#toggleEcho}>
+				<section class=${`echo-card ${mode}`} aria-live=polite>
+					<button class=echo-bar aria-label=${audio.mic.get() ? 'Stop Echo' : 'Start Echo'} aria-pressed=${audio.mic.get()} aria-keyshortcuts=E
+						?disabled=${recording} @click=${this.#toggleEcho}>
+						<span class=badge>${badge}</span>
 						<span class=stack>
-							<strong>Repeat</strong>
+							<strong>${title}</strong>
 							${keyed(text, html`<span class=${current === 'error' ? 'status error' : 'status'}>${text}</span>`)}
 						</span>
-						<span class=switch></span>
+						${wave}
 					</button>
-					${panel}
 					<div class=last-row>
 						${this.#playLast()}
 						<div class=stack>
 							<strong>Last phrase</strong>
 							<span class=meta>${phrase ? this.#length(phrase.duration) : 'Nothing yet'}</span>
 						</div>
+						${this.#saveButton()}
 					</div>
 				</section>
 
-				<dialog class=sheet @click=${this.#dismiss}>
+				<dialog id=settings class=sheet @click=${this.#dismiss}>
 					<div class=grip></div>
 					<header class=sheet-head>
 						<h2>Settings</h2>
-						<button class='button' @click=${this.#closeSettings}>Done</button>
+						<button class=icon-button aria-label=Close @click=${this.#closeSettings}>${icons.close}</button>
 					</header>
-					${this.#settings()}
+					${this.#settings(false)}
 				</dialog>
+
+				${this.#library(false)}
 			</main>
 		`
 	}
@@ -162,6 +210,7 @@ class MirrorPage extends SignalWatcher(LitElement) {
 		const mode = this.#mode
 		const current = audio.status.get()
 		const phrase = audio.phrase.get()
+		const recordingSecondsLeft = audio.recordingSecondsLeft.get()
 		const progress = audio.progress
 		const peaks = phrase?.peaks ?? []
 		const strip = mode === 'listen'
@@ -169,14 +218,19 @@ class MirrorPage extends SignalWatcher(LitElement) {
 			: mode === 'repeat'
 				? this.#bars(resample(peaks, 60), progress)
 				: this.#bars(Array(60).fill(0))
-		const pill = current === 'error'
-			? 'Microphone unavailable'
+		const recorder = audio.recorder.get()
+		const all = recordings.list.get()
+		const pill = this.#notice
+			? this.#notice.pill
+			: recorder ? `Recording ${clock((performance.now() - recorder) / 1000)} — press Rec again to save`
+			: current === 'error' ? 'Microphone unavailable'
 			: this.#replaying ? 'Playing last phrase' : {
 				off: 'Echo off — metronome only',
 				listen: current === 'requesting' ? 'Echo · connecting the mic…' : 'Echo · listening — play your phrase',
 				repeat: 'Echo · playing back — mic paused'
 			}[mode]
-		const caption = current === 'recording' ? 'Recording' : mode === 'repeat' ? 'Playing back' : 'Listening'
+		const pillClass = this.#notice ? 'pill notice' : recorder ? 'pill rec' : 'pill'
+		const caption = current === 'recording' ? recordingSecondsLeft ? `Recording ends in ${recordingSecondsLeft}s` : 'Recording' : mode === 'repeat' ? 'Playing back' : 'Listening'
 		const ring = mode === 'off'
 			? html`
 				<span class=ring-idle>
@@ -194,24 +248,23 @@ class MirrorPage extends SignalWatcher(LitElement) {
 			<main class='page desktop'>
 				<aside class=left>
 					<header class=brand>
-						<h1>Echo</h1>
+						<h1>Echo <span class=version>${__VERSION__}</span></h1>
 						<p>call &amp; response practice</p>
 					</header>
 					<section class='card metronome' aria-label=Metronome>
-						<header class=card-head>
-							<h2 class=label>Metronome</h2>
-							${this.#pulse()}
-						</header>
-						<bpm-wheel .value=${audio.bpm} @change=${this.#wheel}></bpm-wheel>
+						<h2 class=label>Metronome</h2>
+						${this.#dial()}
+						${this.#tempoBar()}
 						${this.#transport()}
 					</section>
 				</aside>
 
 				<section class=${`center ${mode}`} aria-live=polite>
-					<p class=pill>${mode === 'listen' ? html`<span class=blink></span>` : ''}${keyed(pill, html`<span>${pill}</span>`)}</p>
+					<p class=${pillClass}>${mode === 'listen' || recorder ? html`<span class=blink></span>` : ''}${keyed(pill, html`<span>${pill}</span>`)}</p>
 
 					<div class=ring-area>
-						<button class=ring aria-label=${audio.mic.get() ? 'Stop Echo' : 'Start Echo'} aria-pressed=${audio.mic.get()} aria-keyshortcuts=R @click=${this.#toggleEcho}>
+						<button class=ring aria-label=${audio.mic.get() ? 'Stop Echo' : 'Start Echo'} aria-pressed=${audio.mic.get()} aria-keyshortcuts=E
+							?disabled=${Boolean(recorder)} @click=${this.#toggleEcho}>
 							<svg viewBox='0 0 300 300' aria-hidden=true>
 								<circle class=track cx=150 cy=150 r=146 pathLength=100></circle>
 								<circle class=arc cx=150 cy=150 r=146 pathLength=100 style=${`stroke-dasharray: ${mode === 'repeat' ? Math.max(4, progress * 100) : 0} 100`}></circle>
@@ -222,27 +275,141 @@ class MirrorPage extends SignalWatcher(LitElement) {
 						${audio.error.get() ? html`<p class=error role=alert>${audio.error.get()}</p>` : ''}
 					</div>
 
-					<p class=shortcuts><kbd>Space</kbd> — metronome · <kbd>R</kbd> — Echo on/off · <kbd>T</kbd> — tap · <kbd>L</kbd> — last phrase</p>
+					<p class=shortcuts><kbd>Space</kbd> — Echo + metronome · <kbd>E</kbd> — Echo · <kbd>M</kbd> — metronome · <kbd>T</kbd> — tap · <kbd>L</kbd> — last phrase · <kbd>R</kbd> — record</p>
 				</section>
 
 				<aside class=right>
 					<section class='card last'>
-						<h2 class=label>Last phrase</h2>
-						<div class=last-wave>${this.#bars(resample(peaks, 36))}</div>
-						<div class=last-row>
+						<header class=last-head>
+							<h2 class=label>Last phrase <span>${phrase ? clock(phrase.duration) : '—'}</span></h2>
+							${this.#saveButton()}
+						</header>
+						<div class=last-wave>
 							${this.#playLast()}
-							<div class=stack>
-								<span class=meta>${phrase ? this.#length(phrase.duration) : 'Nothing yet'}</span>
-								<span class=muted>${mode === 'listen' ? 'Mic pauses while it plays' : 'Only the latest is kept'}</span>
-							</div>
+							${this.#bars(resample(peaks, 36))}
 						</div>
 					</section>
-					<section class='card'>
-						<h2 class=label>Settings</h2>
-						${this.#settings()}
+					<section class='card saved'>
+						<h2 class=label><span>Saved</span><span>${all.length}</span></h2>
+						${all.length
+							? html`<div class=rows>${all.slice(0, 3).map(item => this.#row(item, false, daysAgo(item.created) ? dateFormat.format(item.created) : time(item.created)))}</div>`
+							: html`<p class=muted>Nothing saved yet.</p>`}
+						<button class=button @click=${this.#openLibrary}>All recordings ${icons.next}</button>
+					</section>
+					<section class='card settings-card'>
+						<h2>
+							<button class='label disclosure' aria-expanded=${this.#settingsOpen} aria-controls=desktop-settings
+								@click=${() => this.#set(() => this.#settingsOpen = !this.#settingsOpen)}>Settings ${icons.chevron}</button>
+						</h2>
+						<div id=desktop-settings ?hidden=${!this.#settingsOpen}>${this.#settings(true)}</div>
 					</section>
 				</aside>
+
+				${this.#library(true)}
 			</main>
+		`
+	}
+
+	#dial () {
+		return html`
+			<div class=dial>
+				${this.#pulse()}
+				<bpm-wheel .value=${audio.bpm} @change=${this.#wheel}></bpm-wheel>
+			</div>
+		`
+	}
+
+	#library (wide : boolean) {
+		const all = recordings.list.get()
+		const query = this.#query.trim().toLowerCase()
+		const shown = this.#libraryOpen ? all.filter(item => !query || `${item.name} ${item.bpm} bpm ${day(item.created)} ${time(item.created)}`.toLowerCase().includes(query)) : []
+		const groups : { label : string, items : Recording[] }[] = []
+		for (const item of shown) {
+			const label = day(item.created)
+			if (groups.at(-1)?.label !== label) groups.push({ label, items: [] })
+			groups.at(-1)!.items.push(item)
+		}
+		const deleted = this.#deleted
+
+		return html`
+			<dialog id=library class=${wide ? 'drawer library' : 'sheet library'} aria-label='All recordings' @click=${this.#dismiss} @close=${this.#libraryClosed}>
+				<header class=library-head>
+					${wide ? '' : html`<div class=grip></div>`}
+					<div class=sheet-head>
+						<h2>All recordings <span class=meta>${all.length}</span></h2>
+						<button class=icon-button aria-label=Close @click=${this.#closeLibrary}>${icons.close}</button>
+					</div>
+					<label class=search>
+						${icons.search}
+						<input type=search aria-label='Search recordings' placeholder='Search by name, BPM or date' .value=${this.#query}
+							@input=${(event : Event) => this.#set(() => this.#query = (event.target as HTMLInputElement).value)}>
+					</label>
+				</header>
+				<div class=list>
+					${this.#libraryOpen && !shown.length
+						? html`<p class=empty>${all.length ? 'Nothing matches.' : 'No recordings yet. Save the last phrase or press Rec to keep one.'}</p>`
+						: ''}
+					${groups.map(group => html`
+						<section>
+							<h3 class=label>${group.label}</h3>
+							${group.items.map(item => this.#row(item, true, time(item.created)))}
+						</section>
+					`)}
+				</div>
+				${deleted ? this.#toast('Recording deleted', `${deleted.recording.name} · ${clock(deleted.recording.duration)}`, 'trash', { label: 'Undo', run: () => void this.#undo() }) : ''}
+			</dialog>
+		`
+	}
+
+	#row (recording : Recording, removable : boolean, when : string) {
+		const playing = audio.saved.get() === recording.id
+		return html`
+			<article class=${playing ? 'recording playing' : 'recording'}>
+				<button class='icon-button solid play' aria-label=${`${playing ? 'Pause' : 'Play'} ${recording.name}`}
+					@click=${() => playing ? audio.stopSaved() : void audio.playSaved(recording.id, () => recordings.open(recording))}>${playing ? icons.pause : icons.play}</button>
+				<div class=body>
+					<div class=line><strong>${recording.name}</strong><span class=meta>${when}</span></div>
+					<div class=line>${this.#bars(resample(recording.peaks, 30))}<span class=meta>${clock(recording.duration)} · ${recording.bpm} BPM</span></div>
+				</div>
+				${removable ? html`
+					<button class='icon-button remove' aria-label=${`Delete ${recording.name}`} @click=${() => void this.#remove(recording)}>${icons.trash}</button>
+				` : ''}
+			</article>
+		`
+	}
+
+	#toast (heading : string, detail : string, icon : 'check' | 'trash', action? : { label : string, run : () => void }) {
+		return html`
+			<div class=${`toast ${icon}`} role=status>
+				<span class=badge>${icons[icon]}</span>
+				<span class=stack>
+					<strong>${heading}</strong>
+					<span class=meta>${detail}</span>
+				</span>
+				${action ? html`<button class=button @click=${action.run}>${action.label}</button>` : ''}
+			</div>
+		`
+	}
+
+	#saveButton () {
+		const phrase = audio.phrase.get()
+		const saved = Boolean(phrase) && phrase === this.#savedPhrase
+		return html`
+			<button class=${saved ? 'button small done' : 'button small'} aria-label=${saved ? 'Last phrase saved' : 'Save last phrase'}
+				?disabled=${!phrase} @click=${this.#saveLast}>
+				${saved ? icons.bookmarked : icons.bookmark}${saved ? 'Saved' : 'Save'}
+			</button>
+		`
+	}
+
+	#recButton () {
+		const started = audio.recorder.get()
+		return html`
+			<button class=${started ? 'button round rec on' : 'button round rec'} aria-label=${started ? 'Stop recording and save' : 'Record until stopped'}
+				aria-pressed=${Boolean(started)} aria-keyshortcuts=R @click=${this.#toggleRecorder}>
+				<span class=dot aria-hidden=true></span>
+				${started ? html`<span class=clock>${clock((performance.now() - started) / 1000)}</span>` : 'Rec'}
+			</button>
 		`
 	}
 
@@ -252,16 +419,27 @@ class MirrorPage extends SignalWatcher(LitElement) {
 		return html`<span class=${`pulse ${running ? beat % 2 ? 'odd' : 'even' : ''}`} style=${`--beat: ${audio.beatDuration}s`} aria-hidden=true></span>`
 	}
 
+	#tempoBar () {
+		return html`
+			<div class=tempo-bar role=group aria-label='Quick tempo'>
+				<button aria-label=${`Reset to default tempo, ${audio.defaultBpm} BPM`} @click=${() => this.#tempo(audio.defaultBpm)}>
+					${icons.reset}${audio.defaultBpm}
+				</button>
+				${shifts.map(item => html`<button aria-label=${item.name} @click=${() => this.#tempo(audio.bpm * item.factor)}>${item.label}</button>`)}
+			</div>
+		`
+	}
+
 	#transport () {
 		const running = audio.transport.get()
 		return html`
 			<div class=transport>
 				${this.#tapButton()}
 				<button class=${`play-button ${running ? 'solid' : ''}`} aria-label=${running ? 'Pause metronome' : 'Start metronome'}
-					aria-pressed=${running} aria-keyshortcuts=Space @click=${this.#toggleMetronome}>
+					aria-pressed=${running} aria-keyshortcuts=M @click=${this.#toggleMetronome}>
 					${running ? icons.pause : icons.play}
 				</button>
-				<span class=tap aria-hidden=true></span>
+				${this.#recButton()}
 			</div>
 		`
 	}
@@ -281,24 +459,55 @@ class MirrorPage extends SignalWatcher(LitElement) {
 	}
 
 	#playLast () {
+		const playing = audio.status.get() === 'playing'
 		return html`
-			<button class='icon-button solid play' aria-label='Play last phrase' aria-keyshortcuts=L
-				?disabled=${!audio.phrase.get()} @click=${() => audio.playLast()}>${icons.play}</button>
+			<button class='icon-button solid play' aria-label=${playing ? 'Stop last phrase' : 'Play last phrase'} aria-pressed=${playing} aria-keyshortcuts=L
+				?disabled=${!audio.phrase.get()} @click=${() => audio.playLast()}>${playing ? icons.pause : icons.play}</button>
 		`
 	}
 
-	#settings () {
+	#settings (wide : boolean) {
 		const sensitivity = 21 - Math.round(audio.threshold * 100)
 		const decibels = Math.round(20 * Math.log10(audio.threshold))
 		const marker = Math.min(1, audio.gate / .35)
 
 		return html`
 			<div class=settings>
+				${wide ? html`
+					<label class='field inline'>
+						<span class=field-head>Default tempo</span>
+						<span class=number>
+							<input type=number min=30 max=240 inputmode=numeric .value=${String(audio.defaultBpm)}
+								@change=${(event : Event) => this.#setDefault(event.target as HTMLInputElement)}>
+							<span class=meta>BPM</span>
+						</span>
+					</label>` : html`
+					<div class='field inline'>
+						<span class=stack>
+							<strong>Default tempo</strong>
+							<span class=muted>Where the reset button takes you</span>
+						</span>
+						<span class=stepper role=group aria-label='Default tempo'>
+							<button aria-label='Lower default tempo' ?disabled=${audio.defaultBpm <= 30} @click=${() => this.#set(() => audio.defaultBpm--)}>−</button>
+							<output aria-live=polite>${audio.defaultBpm}</output>
+							<button aria-label='Raise default tempo' ?disabled=${audio.defaultBpm >= 240} @click=${() => this.#set(() => audio.defaultBpm++)}>+</button>
+						</span>
+					</div>`}
+
 				<fieldset>
 					<legend>End of phrase <span class=muted>How much silence counts as a pause</span></legend>
 					<div class=segmented>
 						${endings.map(item => html`
 							<button aria-pressed=${audio.silenceBeats === item.beats} @click=${() => this.#set(() => audio.silenceBeats = item.beats)}>${item.label}</button>
+						`)}
+					</div>
+				</fieldset>
+
+				<fieldset>
+					<legend>Recording buffer <span class=muted>Longest phrase that can be captured</span></legend>
+					<div class=segmented>
+						${buffers.map(item => html`
+							<button aria-pressed=${audio.bufferSeconds === item.seconds} @click=${() => this.#set(() => audio.bufferSeconds = item.seconds)}>${item.label}</button>
 						`)}
 					</div>
 				</fieldset>
@@ -317,6 +526,12 @@ class MirrorPage extends SignalWatcher(LitElement) {
 						@input=${(event : Event) => this.#set(() => audio.volume = Number((event.target as HTMLInputElement).value) / 100)}>
 				</label>
 
+				<label class=field>
+					<span class=field-head>Metronome volume <span class=meta>${Math.round(audio.metronomeVolume * 100)}%</span></span>
+					<input type=range min=0 max=100 .value=${String(Math.round(audio.metronomeVolume * 100))}
+						@input=${(event : Event) => this.#set(() => audio.metronomeVolume = Number((event.target as HTMLInputElement).value) / 100)}>
+				</label>
+
 				<fieldset>
 					<legend>Metronome sound</legend>
 					<div class=chips>
@@ -325,8 +540,6 @@ class MirrorPage extends SignalWatcher(LitElement) {
 						`)}
 					</div>
 				</fieldset>
-
-				<span class=version>${__VERSION__}</span>
 			</div>
 		`
 	}
@@ -367,15 +580,27 @@ class MirrorPage extends SignalWatcher(LitElement) {
 			this.#sampledAt = now
 			this.#history.push(audio.mic.get() ? audio.level.get() : 0)
 			this.#history.shift()
-			if (audio.mic.get() || current === 'playing') this.requestUpdate()
+			if (audio.mic.get() || current === 'playing' || audio.recorder.get()) this.requestUpdate()
 		}
 
 		this.#frame = requestAnimationFrame(() => this.#tick())
 	}
 
 	#toggleEcho () {
+		if (audio.recorder.get()) return
 		if (audio.mirrorRunning) audio.stopMirror()
 		else void audio.startMirror()
+	}
+
+	#toggleAll () {
+		if (audio.recorder.get()) return
+		if (audio.mirrorRunning) {
+			audio.stopMirror()
+			audio.stopTransport()
+		} else {
+			void audio.startMirror()
+			void audio.startTransport()
+		}
 	}
 
 	#toggleMetronome () {
@@ -383,20 +608,108 @@ class MirrorPage extends SignalWatcher(LitElement) {
 		else void audio.startTransport()
 	}
 
+	async #toggleRecorder () {
+		if (!audio.recorder.get()) {
+			void audio.startRecorder()
+			return
+		}
+
+		const take = await audio.stopRecorder()
+		if (take) await this.#keep(take.blob, take.duration, take.peaks, true)
+	}
+
+	async #saveLast () {
+		const phrase = audio.phrase.get()
+		if (!phrase || phrase === this.#savedPhrase) return
+
+		this.#set(() => this.#savedPhrase = phrase)
+		if (!await this.#keep(wav(phrase.buffer), phrase.duration, phrase.peaks, false)) this.#set(() => this.#savedPhrase = null)
+	}
+
+	async #keep (blob : Blob, duration : number, peaks : number[], announce : boolean) {
+		try {
+			const recording = await recordings.add(blob, { duration, bpm: audio.bpm, peaks })
+			if (announce) this.#notify({ heading: 'Saved to recordings', detail: `${recording.name} · ${clock(duration)}`, pill: `${recording.name} saved · ${clock(duration)}` })
+			return true
+		} catch {
+			this.#notify({ heading: 'Could not save', detail: 'This browser blocks storage here', pill: 'Could not save — this browser blocks storage here', failed: true })
+			return false
+		}
+	}
+
+	#notify (notice : Notice) {
+		clearTimeout(this.#noticeTimer)
+		this.#set(() => this.#notice = notice)
+		this.#noticeTimer = window.setTimeout(() => this.#set(() => this.#notice = null), 3500)
+	}
+
+	async #remove (recording : Recording) {
+		if (audio.saved.get() === recording.id) audio.stopSaved()
+		let blob : Blob
+		try {
+			blob = await recordings.remove(recording)
+		} catch {
+			return
+		}
+
+		clearTimeout(this.#deletedTimer)
+		this.#set(() => this.#deleted = { recording, blob })
+		this.#deletedTimer = window.setTimeout(() => this.#set(() => this.#deleted = null), 4000)
+	}
+
+	async #undo () {
+		const deleted = this.#deleted
+		if (!deleted) return
+
+		clearTimeout(this.#deletedTimer)
+		this.#set(() => this.#deleted = null)
+		await recordings.restore(deleted.recording, deleted.blob)
+	}
+
 	#openSettings () {
-		this.querySelector<HTMLDialogElement>('dialog.sheet')?.showModal()
+		this.querySelector<HTMLDialogElement>('#settings')?.showModal()
 	}
 
 	#closeSettings () {
-		this.querySelector<HTMLDialogElement>('dialog.sheet')?.close()
+		this.querySelector<HTMLDialogElement>('#settings')?.close()
 	}
 
+	#openLibrary () {
+		clearTimeout(this.#noticeTimer)
+		this.#notice = null
+		this.#set(() => this.#libraryOpen = true)
+		this.querySelector<HTMLDialogElement>('#library')?.showModal()
+	}
+
+	#closeLibrary () {
+		this.querySelector<HTMLDialogElement>('#library')?.close()
+	}
+
+	#libraryClosed () {
+		audio.stopSaved()
+		this.#set(() => this.#libraryOpen = false)
+	}
+
+	// A click on the dialog itself, outside its content, lands on the backdrop.
 	#dismiss (event : MouseEvent) {
-		if (event.target === event.currentTarget) this.#closeSettings()
+		if (event.target === event.currentTarget) (event.currentTarget as HTMLDialogElement).close()
 	}
 
 	#set (change : () => void) {
 		change()
+		this.requestUpdate()
+	}
+
+	#setDefault (input : HTMLInputElement) {
+		const value = Number(input.value)
+		if (input.value !== '' && Number.isFinite(value)) audio.defaultBpm = value
+		// Show the clamped value, or put the old one back after an empty entry.
+		input.value = String(audio.defaultBpm)
+		this.requestUpdate()
+	}
+
+	#tempo (bpm : number) {
+		audio.setTempo(bpm)
 		this.requestUpdate()
 	}
 

@@ -11,6 +11,7 @@ export class BpmWheel extends LitElement {
 
 	#list : HTMLElement | null = null
 	#steering = 0
+	#target = -1
 
 	createRenderRoot () {
 		return this
@@ -20,7 +21,7 @@ export class BpmWheel extends LitElement {
 		return html`
 			<div class=wheel role=spinbutton tabindex=0 aria-label='Tempo, BPM'
 				aria-valuemin=${min} aria-valuemax=${max} aria-valuenow=${this.value}
-				@scroll=${this.#scroll} @scrollend=${this.#settle} @keydown=${this.#key}>
+				@scroll=${this.#scroll} @scrollend=${this.#scrollEnd} @keydown=${this.#key}>
 				<div class=spacer></div>
 				${values.map(value => {
 					const distance = Math.abs(value - this.value)
@@ -38,7 +39,9 @@ export class BpmWheel extends LitElement {
 	}
 
 	updated () {
-		if (this.#list && this.#valueAtScroll() !== this.value && !this.#steering) this.#scrollTo(this.value, 'smooth')
+		// Mid-glide, a new value (another quick-tempo press) redirects the glide.
+		const shown = this.#steering ? this.#target : this.#valueAtScroll()
+		if (this.#list && shown !== this.value) this.#scrollTo(this.value, 'smooth')
 	}
 
 	get #step () {
@@ -53,19 +56,38 @@ export class BpmWheel extends LitElement {
 	#scrollTo (value : number, behavior : ScrollBehavior) {
 		if (!this.#list) return
 
-		// Programmatic scrolls fire intermediate scroll events; ignore them until it settles.
+		// Programmatic scrolls fire intermediate scroll events; ignore them until the wheel
+		// reaches the target. Long jumps (2×, ½×) take well over a second to glide there.
 		window.clearTimeout(this.#steering)
-		this.#steering = window.setTimeout(() => this.#settle(), 600)
+		this.#steering = window.setTimeout(() => {
+			// The glide never arrived (throttled tab, or cut short): land on the value instantly.
+			if (this.#list && !this.#arrived) this.#list.scrollTop = (this.#target - min) * this.#step
+			this.#settle()
+		}, 2000)
+		this.#target = value
 		this.#list.scrollTo({ top: (value - min) * this.#step, behavior })
 	}
 
 	#settle () {
 		window.clearTimeout(this.#steering)
 		this.#steering = 0
+		this.#target = -1
+	}
+
+	get #arrived () {
+		return Math.abs((this.#list?.scrollTop ?? 0) - (this.#target - min) * this.#step) < 1
+	}
+
+	// A scroll cut short by a newer one also ends; only the one reaching the target settles.
+	#scrollEnd () {
+		if (!this.#steering || this.#arrived) this.#settle()
 	}
 
 	#scroll () {
-		if (this.#steering) return
+		if (this.#steering) {
+			if (this.#arrived) this.#settle()
+			return
+		}
 
 		const value = this.#valueAtScroll()
 		if (value !== this.value) this.#change(value)
