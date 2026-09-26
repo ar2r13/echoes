@@ -2,7 +2,7 @@
 	"version": "0.0.1",
 	"configurations": [
 		{
-			"name": "echo",
+			"name": "auto-playback-metronome",
 			"runtimeExecutable": "npm",
 			"runtimeArgs": ["start"],
 			"port": 8000

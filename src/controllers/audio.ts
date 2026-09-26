@@ -523,7 +523,7 @@ class AudioController {
 	}
 
 	async tick () {
-		navigator.vibrate?.(8)
+		navigator.vibrate?.(1)
 		const context = await this.#getContext()
 		const time = context.currentTime + .005
 		const oscillator = context.createOscillator()

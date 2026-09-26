@@ -3,8 +3,10 @@ import { LitElement, html } from 'lit'
 import { customElement } from 'lit/decorators.js'
 import { keyed } from 'lit/directives/keyed.js'
 import { audio, bufferOptions, wav, type ClickSound, type Phrase } from '../../controllers/audio.ts'
+import { drive } from '../../controllers/drive.ts'
 import { recordings, type Recording } from '../../controllers/recordings.ts'
 import '../../components/bpm-wheel.ts'
+import '../../components/sync-bar.ts'
 
 type Mode = 'off' | 'listen' | 'repeat'
 
@@ -26,8 +28,18 @@ const icons = {
 	close: html`<svg viewBox='0 0 24 24' aria-hidden=true class=stroke><path d='M6 6l12 12M18 6L6 18'></path></svg>`,
 	search: html`<svg viewBox='0 0 24 24' aria-hidden=true class=stroke><circle cx=11 cy=11 r=7></circle><path d='M20 20l-4-4'></path></svg>`,
 	trash: html`<svg viewBox='0 0 24 24' aria-hidden=true class=stroke><path d='M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3'></path></svg>`,
-	check: html`<svg viewBox='0 0 24 24' aria-hidden=true class=stroke><path d='M5 12.5l4.5 4.5L19 7.5'></path></svg>`
+	check: html`<svg viewBox='0 0 24 24' aria-hidden=true class=stroke><path d='M5 12.5l4.5 4.5L19 7.5'></path></svg>`,
+	copy: html`<svg viewBox='0 0 24 24' aria-hidden=true class=stroke><rect x=8 y=8 width=12 height=12 rx=2.5></rect><path d='M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2'></path></svg>`,
+	heart: html`<svg viewBox='0 0 24 24' aria-hidden=true class=stroke><path d='M12 20s-7-4.4-7-10a4 4 0 0 1 7-2.6A4 4 0 0 1 19 10c0 5.6-7 10-7 10z'></path></svg>`,
+	download: html`<svg viewBox='0 0 24 24' aria-hidden=true class=stroke><path d='M12 5v10M7.5 10.5L12 15l4.5-4.5M6 19h12'></path></svg>`,
+	more: html`<svg viewBox='0 0 24 24' aria-hidden=true><circle cx=12 cy=5 r=1.8 fill=currentColor></circle><circle cx=12 cy=12 r=1.8 fill=currentColor></circle><circle cx=12 cy=19 r=1.8 fill=currentColor></circle></svg>`,
+	pending: html`<svg viewBox='0 0 24 24' aria-hidden=true class=stroke><path d='M7 18a4.5 4.5 0 0 1-.6-8.96A6 6 0 0 1 18 9.5a4 4 0 0 1-.5 8.5z'></path><path d='M12 16v-5M9.5 13.5L12 11l2.5 2.5'></path></svg>`,
+	synced: html`<svg viewBox='0 0 24 24' aria-hidden=true class=stroke><path d='M7 18a4.5 4.5 0 0 1-.6-8.96A6 6 0 0 1 18 9.5a4 4 0 0 1-.5 8.5z'></path><path d='M9.5 13.5l2 2 3.5-3.5'></path></svg>`
 }
+
+const wallets = [
+	{ id: 'evm', network: 'EVM', tokens: 'Ethereum, BNB Chain, Polygon, Arbitrum, Base… · any token', address: '0xc09c52493b580681dbfC43CF455256a7A1C9c7db' }
+]
 
 type Notice = { heading : string, detail : string, pill : string, failed? : boolean }
 
@@ -63,8 +75,10 @@ class MirrorPage extends SignalWatcher(LitElement) {
 	#savedPhrase : Phrase | null = null
 	#notice : Notice | null = null
 	#noticeTimer = 0
-	#deleted : { recording : Recording, blob : Blob } | null = null
+	#deleted : { recording : Recording, blob : Blob | null } | null = null
 	#deletedTimer = 0
+	#copied = ''
+	#copiedTimer = 0
 	#resize = () => this.requestUpdate()
 	#keyboard = (event : KeyboardEvent) => {
 		if (event.altKey || event.ctrlKey || event.metaKey) return
@@ -110,6 +124,7 @@ class MirrorPage extends SignalWatcher(LitElement) {
 		cancelAnimationFrame(this.#frame)
 		clearTimeout(this.#noticeTimer)
 		clearTimeout(this.#deletedTimer)
+		clearTimeout(this.#copiedTimer)
 		this.#tools?.abort()
 		audio.dispose()
 		super.disconnectedCallback()
@@ -128,7 +143,7 @@ class MirrorPage extends SignalWatcher(LitElement) {
 		return audio.mic.get() ? 'listen' : 'off'
 	}
 
-	// Playing the last phrase while Echo is off.
+	// Playing the last phrase while Auto Playback is off.
 	get #replaying () {
 		return audio.status.get() === 'playing' && !audio.mic.get()
 	}
@@ -140,12 +155,12 @@ class MirrorPage extends SignalWatcher(LitElement) {
 		const recordingSecondsLeft = audio.recordingSecondsLeft.get()
 		const recording = Boolean(audio.recorder.get())
 		const count = recordings.list.get().length
-		const title = this.#replaying ? 'Last phrase' : { off: 'Echo', listen: 'Listening', repeat: 'Playing back' }[mode]
+		const title = this.#replaying ? 'Last phrase' : { off: 'Auto Playback', listen: 'Listening', repeat: 'Playing back' }[mode]
 		const text = current === 'error'
 			? audio.error.get()
 			: recording ? 'Paused while recording' : this.#replaying ? 'Mic paused' : {
 				off: 'Tap, then play a phrase',
-				listen: current === 'requesting' ? 'Connecting the mic…' : current === 'recording' ? recordingSecondsLeft ? `Recording ends in ${recordingSecondsLeft}s` : 'Recording' : 'Pause and I’ll echo it',
+				listen: current === 'requesting' ? 'Connecting the mic…' : current === 'recording' ? recordingSecondsLeft ? `Recording ends in ${recordingSecondsLeft}s` : 'Recording' : 'Pause — it plays right back',
 				repeat: 'Mic paused'
 			}[mode]
 		const badge = { off: icons.mic, listen: html`<span class=blink></span>`, repeat: icons.repeat }[mode]
@@ -157,7 +172,7 @@ class MirrorPage extends SignalWatcher(LitElement) {
 		return html`
 			<main class='page mobile'>
 				<header class=top>
-					<h1>Echo <span class=version>${__VERSION__}</span></h1>
+					${this.#logo()}
 					<div class=actions>
 						<button class=button aria-label=${`All recordings, ${count}`} @click=${this.#openLibrary}>${icons.bookmark}${count}</button>
 						<button class='icon-button' aria-label=Settings @click=${this.#openSettings}>${icons.sliders}</button>
@@ -173,7 +188,7 @@ class MirrorPage extends SignalWatcher(LitElement) {
 				</section>
 
 				<section class=${`echo-card ${mode}`} aria-live=polite>
-					<button class=echo-bar aria-label=${audio.mic.get() ? 'Stop Echo' : 'Start Echo'} aria-pressed=${audio.mic.get()} aria-keyshortcuts=E
+					<button class=echo-bar aria-label=${audio.mic.get() ? 'Stop Auto Playback' : 'Start Auto Playback'} aria-pressed=${audio.mic.get()} aria-keyshortcuts=E
 						?disabled=${recording} @click=${this.#toggleEcho}>
 						<span class=badge>${badge}</span>
 						<span class=stack>
@@ -199,9 +214,11 @@ class MirrorPage extends SignalWatcher(LitElement) {
 						<button class=icon-button aria-label=Close @click=${this.#closeSettings}>${icons.close}</button>
 					</header>
 					${this.#settings(false)}
+					<button class=support-link @click=${this.#openSupport}>${icons.heart}Free &amp; open source · Support the project</button>
 				</dialog>
 
 				${this.#library(false)}
+				${this.#support(false)}
 			</main>
 		`
 	}
@@ -225,9 +242,9 @@ class MirrorPage extends SignalWatcher(LitElement) {
 			: recorder ? `Recording ${clock((performance.now() - recorder) / 1000)} — press Rec again to save`
 			: current === 'error' ? 'Microphone unavailable'
 			: this.#replaying ? 'Playing last phrase' : {
-				off: 'Echo off — metronome only',
-				listen: current === 'requesting' ? 'Echo · connecting the mic…' : 'Echo · listening — play your phrase',
-				repeat: 'Echo · playing back — mic paused'
+				off: 'Auto Playback off — metronome only',
+				listen: current === 'requesting' ? 'Connecting the mic…' : 'Listening — play your phrase',
+				repeat: 'Playing it back — mic paused'
 			}[mode]
 		const pillClass = this.#notice ? 'pill notice' : recorder ? 'pill rec' : 'pill'
 		const caption = current === 'recording' ? recordingSecondsLeft ? `Recording ends in ${recordingSecondsLeft}s` : 'Recording' : mode === 'repeat' ? 'Playing back' : 'Listening'
@@ -235,7 +252,7 @@ class MirrorPage extends SignalWatcher(LitElement) {
 			? html`
 				<span class=ring-idle>
 					${icons.mic}
-					<strong>Start Echo</strong>
+					<strong>Start Auto Playback</strong>
 					<span>Play a phrase — it plays back after you pause</span>
 				</span>`
 			: html`
@@ -247,10 +264,7 @@ class MirrorPage extends SignalWatcher(LitElement) {
 		return html`
 			<main class='page desktop'>
 				<aside class=left>
-					<header class=brand>
-						<h1>Echo <span class=version>${__VERSION__}</span></h1>
-						<p>call &amp; response practice</p>
-					</header>
+					<header class=brand>${this.#logo()}</header>
 					<section class='card metronome' aria-label=Metronome>
 						<h2 class=label>Metronome</h2>
 						${this.#dial()}
@@ -263,7 +277,7 @@ class MirrorPage extends SignalWatcher(LitElement) {
 					<p class=${pillClass}>${mode === 'listen' || recorder ? html`<span class=blink></span>` : ''}${keyed(pill, html`<span>${pill}</span>`)}</p>
 
 					<div class=ring-area>
-						<button class=ring aria-label=${audio.mic.get() ? 'Stop Echo' : 'Start Echo'} aria-pressed=${audio.mic.get()} aria-keyshortcuts=E
+						<button class=ring aria-label=${audio.mic.get() ? 'Stop Auto Playback' : 'Start Auto Playback'} aria-pressed=${audio.mic.get()} aria-keyshortcuts=E
 							?disabled=${Boolean(recorder)} @click=${this.#toggleEcho}>
 							<svg viewBox='0 0 300 300' aria-hidden=true>
 								<circle class=track cx=150 cy=150 r=146 pathLength=100></circle>
@@ -275,7 +289,7 @@ class MirrorPage extends SignalWatcher(LitElement) {
 						${audio.error.get() ? html`<p class=error role=alert>${audio.error.get()}</p>` : ''}
 					</div>
 
-					<p class=shortcuts><kbd>Space</kbd> — Echo + metronome · <kbd>E</kbd> — Echo · <kbd>M</kbd> — metronome · <kbd>T</kbd> — tap · <kbd>L</kbd> — last phrase · <kbd>R</kbd> — record</p>
+					<p class=shortcuts><kbd>Space</kbd> — Auto Playback + metronome · <kbd>E</kbd> — Auto Playback · <kbd>M</kbd> — metronome · <kbd>T</kbd> — tap · <kbd>L</kbd> — last phrase · <kbd>R</kbd> — record</p>
 				</section>
 
 				<aside class=right>
@@ -303,9 +317,11 @@ class MirrorPage extends SignalWatcher(LitElement) {
 						</h2>
 						<div id=desktop-settings ?hidden=${!this.#settingsOpen}>${this.#settings(true)}</div>
 					</section>
+					<button class=support-link @click=${this.#openSupport}>${icons.heart}Free &amp; open source · Support</button>
 				</aside>
 
 				${this.#library(true)}
+				${this.#support(true)}
 			</main>
 		`
 	}
@@ -316,6 +332,46 @@ class MirrorPage extends SignalWatcher(LitElement) {
 				${this.#pulse()}
 				<bpm-wheel .value=${audio.bpm} @change=${this.#wheel}></bpm-wheel>
 			</div>
+		`
+	}
+
+	#logo () {
+		return html`
+			<h1>
+				<button class=logo aria-label='Auto Playback Metronome — support the project' @click=${this.#openSupport}>Auto Playback<br>Metronome <span class=version>${__VERSION__}</span></button>
+			</h1>
+		`
+	}
+
+	#support (wide : boolean) {
+		return html`
+			<dialog id=support class=${wide ? 'modal support' : 'sheet support'} aria-label='Support the project' @click=${this.#dismiss}>
+				${wide ? '' : html`<div class=grip></div>`}
+				<header class=sheet-head>
+					<h2>Support the project</h2>
+					<button class=icon-button aria-label=Close @click=${this.#closeSupport}>${icons.close}</button>
+				</header>
+				<p class=muted>Auto Playback Metronome is free and open source, with no ads or accounts. If it helps your practice, a tip in crypto keeps it going. Any amount, any token.</p>
+				<div class=wallets>
+					${wallets.map(wallet => {
+						const copied = this.#copied === wallet.id
+						return html`
+							<article class=wallet>
+								<header>
+									<span class=stack>
+										<strong><span class=dot aria-hidden=true></span>${wallet.network}</strong>
+										<span class=muted>${wallet.tokens}</span>
+									</span>
+									<button class=${copied ? 'button small copied' : 'button small'} aria-label=${`Copy ${wallet.network} address`}
+										@click=${(event : Event) => void this.#copy(wallet.id, event.currentTarget as HTMLElement)}>${copied ? icons.check : icons.copy}${copied ? 'Copied' : 'Copy'}</button>
+								</header>
+								<code>${wallet.address}</code>
+							</article>
+						`
+					})}
+					<p class=note>Send only on the network shown on each card — funds sent on another network can be lost.</p>
+				</div>
+			</dialog>
 		`
 	}
 
@@ -344,6 +400,7 @@ class MirrorPage extends SignalWatcher(LitElement) {
 						<input type=search aria-label='Search recordings' placeholder='Search by name, BPM or date' .value=${this.#query}
 							@input=${(event : Event) => this.#set(() => this.#query = (event.target as HTMLInputElement).value)}>
 					</label>
+					<sync-bar></sync-bar>
 				</header>
 				<div class=list>
 					${this.#libraryOpen && !shown.length
@@ -363,16 +420,35 @@ class MirrorPage extends SignalWatcher(LitElement) {
 
 	#row (recording : Recording, removable : boolean, when : string) {
 		const playing = audio.saved.get() === recording.id
+		const cloud = recording.sync === 'cloud'
+		const loading = drive.downloads.get().get(recording.id)
+		const menu = `menu-${recording.id}`
+		const mark = !drive.enabled || cloud ? ''
+			: recording.sync ? html`<span class='sync-mark synced' role=img aria-label='Backed up to Drive' title='Backed up to Drive'>${icons.synced}</span>`
+			: html`<span class=sync-mark role=img aria-label='Waiting to sync' title='Waiting to sync'>${icons.pending}</span>`
+		const main = !cloud
+			? html`<button class='icon-button solid play' aria-label=${`${playing ? 'Pause' : 'Play'} ${recording.name}`}
+				@click=${() => playing ? audio.stopSaved() : void audio.playSaved(recording.id, () => recordings.open(recording))}>${playing ? icons.pause : icons.play}</button>`
+			: loading === undefined
+				? html`<button class='icon-button play' aria-label=${`Download ${recording.name}`} @click=${() => void drive.download(recording).catch(() => {})}>${icons.download}</button>`
+				: html`
+					<button class='icon-button play loading' aria-label=${`Cancel download of ${recording.name}`} style=${`--progress: ${loading}`} @click=${() => drive.cancelDownload(recording)}>
+						<svg viewBox='0 0 44 44' aria-hidden=true><circle class=track cx=22 cy=22 r=19 pathLength=100></circle><circle class=arc cx=22 cy=22 r=19 pathLength=100></circle></svg>
+						<span class=meta>${Math.min(99, Math.round(loading * 100))}</span>
+					</button>`
+
 		return html`
-			<article class=${playing ? 'recording playing' : 'recording'}>
-				<button class='icon-button solid play' aria-label=${`${playing ? 'Pause' : 'Play'} ${recording.name}`}
-					@click=${() => playing ? audio.stopSaved() : void audio.playSaved(recording.id, () => recordings.open(recording))}>${playing ? icons.pause : icons.play}</button>
+			<article class=${`recording ${playing ? 'playing' : ''} ${cloud ? 'cloud' : ''}`}>
+				${main}
 				<div class=body>
-					<div class=line><strong>${recording.name}</strong><span class=meta>${when}</span></div>
-					<div class=line>${this.#bars(resample(recording.peaks, 30))}<span class=meta>${clock(recording.duration)} · ${recording.bpm} BPM</span></div>
+					<div class=line><strong>${recording.name}</strong><span class=meta>${mark}${when}</span></div>
+					<div class=line>${this.#bars(resample(recording.peaks, 30))}<span class=meta>${clock(recording.duration)} · ${recording.bpm} BPM${cloud ? ' · on Drive' : ''}</span></div>
 				</div>
 				${removable ? html`
-					<button class='icon-button remove' aria-label=${`Delete ${recording.name}`} @click=${() => void this.#remove(recording)}>${icons.trash}</button>
+					<button class='icon-button more' popovertarget=${menu} aria-label=${`More options for ${recording.name}`} style=${`anchor-name: --${menu}`}>${icons.more}</button>
+					<div id=${menu} class=row-menu popover style=${`position-anchor: --${menu}`}>
+						<button class=danger @click=${() => this.#delete(recording, menu)}>${icons.trash}Delete</button>
+					</div>
 				` : ''}
 			</article>
 		`
@@ -643,9 +719,15 @@ class MirrorPage extends SignalWatcher(LitElement) {
 		this.#noticeTimer = window.setTimeout(() => this.#set(() => this.#notice = null), 3500)
 	}
 
+	#delete (recording : Recording, menu : string) {
+		this.querySelector<HTMLElement>(`#${CSS.escape(menu)}`)?.hidePopover()
+		void this.#remove(recording)
+	}
+
 	async #remove (recording : Recording) {
 		if (audio.saved.get() === recording.id) audio.stopSaved()
-		let blob : Blob
+		drive.cancelDownload(recording)
+		let blob : Blob | null
 		try {
 			blob = await recordings.remove(recording)
 		} catch {
@@ -672,6 +754,29 @@ class MirrorPage extends SignalWatcher(LitElement) {
 
 	#closeSettings () {
 		this.querySelector<HTMLDialogElement>('#settings')?.close()
+	}
+
+	#openSupport () {
+		this.querySelector<HTMLDialogElement>('#support')?.showModal()
+	}
+
+	#closeSupport () {
+		this.querySelector<HTMLDialogElement>('#support')?.close()
+	}
+
+	async #copy (id : string, button : HTMLElement) {
+		const address = button.closest('.wallet')!.querySelector('code')!
+		try {
+			await navigator.clipboard.writeText(address.textContent!)
+		} catch {
+			// Without clipboard access, select the address so it can be copied by hand at least.
+			getSelection()?.selectAllChildren(address)
+			if (!document.execCommand('copy')) return
+		}
+
+		clearTimeout(this.#copiedTimer)
+		this.#set(() => this.#copied = id)
+		this.#copiedTimer = window.setTimeout(() => this.#set(() => this.#copied = ''), 1800)
 	}
 
 	#openLibrary () {
@@ -726,7 +831,7 @@ class MirrorPage extends SignalWatcher(LitElement) {
 		void Promise.resolve(document.modelContext.registerTool({
 			name: 'set_tempo',
 			title: 'Set tempo',
-			description: 'Sets the Echo metronome tempo in BPM.',
+			description: 'Sets the Auto Playback Metronome tempo in BPM.',
 			inputSchema: {
 				type: 'object',
 				properties: {

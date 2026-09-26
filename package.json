@@ -1,6 +1,6 @@
 {
-    "version": "1.2.0",
-	"name": "mirror-metronome",
+    "version": "1.3.0",
+	"name": "auto-playback-metronome",
 	"private": true,
 	"type": "module",
 	"scripts": {

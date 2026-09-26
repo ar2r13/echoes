@@ -16,6 +16,8 @@ await Promise.all([
 	cp(`${root}/src/favicon.svg`, `${root}/www/favicon.svg`),
 	cp(`${root}/src/icon-192.png`, `${root}/www/icon-192.png`),
 	cp(`${root}/src/icon-512.png`, `${root}/www/icon-512.png`),
+	cp(`${root}/src/icon-maskable-512.png`, `${root}/www/icon-maskable-512.png`),
+	cp(`${root}/src/apple-touch-icon.png`, `${root}/www/apple-touch-icon.png`),
 	cp(`${root}/src/hat.wav`, `${root}/www/hat.wav`)
 ])
 
