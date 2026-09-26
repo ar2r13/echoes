@@ -34,9 +34,7 @@ if (serving) {
 	await builder.watch()
 	const server = await builder.serve({ servedir: `${root}/www`, host: '127.0.0.1', port: 8000 })
 
-	console.log(`Local: http://${server.host}:${server.port}`)
+	console.log(`Local: http://127.0.0.1:${server.port}`)
 } else {
 	await build(options)
-	await rm(`${root}/dist`, { recursive: true, force: true })
-	await cp(`${root}/www`, `${root}/dist`, { recursive: true })
 }

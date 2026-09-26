@@ -1,11 +1,11 @@
 {
-	"name": "Mirror — музыкальное зеркало",
-	"short_name": "Mirror",
-	"description": "Метроном, который автоматически записывает и повторяет сыгранную фразу.",
+	"name": "Echo — metronome and repeat",
+	"short_name": "Echo",
+	"description": "Metronome and call & response practice.",
 	"start_url": "/",
 	"display": "standalone",
-	"background_color": "#f5f7f8",
-	"theme_color": "#f5f7f8",
+	"background_color": "#121110",
+	"theme_color": "#121110",
 	"icons": [
 		{
 			"src": "/favicon.svg",

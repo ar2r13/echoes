@@ -1,4 +1,4 @@
-const cache = 'mirror-v1'
+const cache = 'mirror-v4'
 const shell = ['/', '/index.js', '/index.css', '/manifest.json', '/favicon.svg']
 
 self.addEventListener('install', event => {
