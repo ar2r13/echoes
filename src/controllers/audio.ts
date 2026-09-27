@@ -2,7 +2,7 @@ import { Signal } from '@lit-labs/signals'
 
 export type MirrorStatus = 'idle' | 'requesting' | 'arming' | 'recording' | 'playing' | 'error'
 export type ClickSound = 'click' | 'woodblock' | 'hihat'
-type Settings = { bpm : number, defaultBpm? : number, silenceBeats : number, threshold : number, sound : ClickSound, volume : number, metronomeVolume? : number, bufferSeconds? : number }
+type Settings = { bpm : number, defaultBpm? : number, silenceBeats : number, threshold : number, sound : ClickSound, volume : number, metronomeVolume? : number, bufferSeconds? : number, input? : string }
 // `onset` is where the first note sits in `buffer`. When `grid` is set, sample 0 of `buffer`
 // is a metronome beat as it reached the mic, so starting it on a beat keeps it in time.
 export type Phrase = { buffer : AudioBuffer, peaks : number[], duration : number, onset : number, grid : boolean }
@@ -114,6 +114,8 @@ class AudioController {
 	readonly recorder = new Signal.State(0)
 	// Id of the saved recording playing now.
 	readonly saved = new Signal.State<string | null>(null)
+	// Microphones the browser reports; their labels stay empty until mic access is granted.
+	readonly inputs = new Signal.State<{ id : string, label : string }[]>([])
 
 	bpm = 60
 	#defaultBpm = 60
@@ -123,6 +125,7 @@ class AudioController {
 	#volume = .8
 	#metronomeVolume = 1
 	#bufferSeconds = 120
+	#device = ''
 
 	#context : AudioContext | null = null
 	#stream : MediaStream | null = null
@@ -184,6 +187,36 @@ class AudioController {
 		this.#volume = settings.volume
 		this.#metronomeVolume = settings.metronomeVolume ?? 1
 		if (bufferOptions.includes(settings.bufferSeconds!)) this.#bufferSeconds = settings.bufferSeconds!
+		this.#device = settings.input ?? ''
+	}
+
+	get #constraints () : MediaTrackConstraints {
+		return this.#device ? { ...microphone, deviceId: { ideal: this.#device } } : microphone
+	}
+
+	// Id of the chosen microphone, or '' for the system default.
+	get input () {
+		return this.#device
+	}
+
+	set input (id : string) {
+		if (id === this.#device) return
+		this.#device = id
+		this.#saveSettings()
+		// A running Auto Playback reopens on the new microphone.
+		if (this.mirrorRunning) {
+			this.stopMirror()
+			void this.startMirror()
+		}
+	}
+
+	async listInputs () {
+		try {
+			const devices = await navigator.mediaDevices.enumerateDevices()
+			this.inputs.set(devices.filter(device => device.kind === 'audioinput' && device.deviceId).map(device => ({ id: device.deviceId, label: device.label })))
+		} catch {
+			this.inputs.set([])
+		}
 	}
 
 	get mirrorRunning () {
@@ -328,7 +361,7 @@ class AudioController {
 			const context = await this.#getContext()
 			this.#tapReady ??= context.audioWorklet.addModule(URL.createObjectURL(new Blob([tapSource], { type: 'text/javascript' })))
 			const [stream] = await Promise.all([
-				navigator.mediaDevices.getUserMedia({ audio: microphone }),
+				navigator.mediaDevices.getUserMedia({ audio: this.#constraints }),
 				this.#tapReady
 			])
 			if (session !== this.#session) {
@@ -337,6 +370,8 @@ class AudioController {
 			}
 
 			this.#stream = stream
+			// Device names show up only once the mic is allowed.
+			void this.listInputs()
 			this.#ring = this.#newRing(context)
 			this.#floor = 0
 			this.#starts = []
@@ -376,7 +411,7 @@ class AudioController {
 		this.error.set('')
 		this.recorder.set(performance.now())
 		try {
-			const stream = await navigator.mediaDevices.getUserMedia({ audio: microphone })
+			const stream = await navigator.mediaDevices.getUserMedia({ audio: this.#constraints })
 			if (session !== this.#recorderSession) {
 				stream.getTracks().forEach(track => track.stop())
 				return
@@ -500,7 +535,8 @@ class AudioController {
 			sound: this.sound,
 			volume: this.volume,
 			metronomeVolume: this.metronomeVolume,
-			bufferSeconds: this.bufferSeconds
+			bufferSeconds: this.bufferSeconds,
+			input: this.#device
 		} satisfies Settings))
 	}
 

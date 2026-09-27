@@ -52,13 +52,6 @@ const daysAgo = (at : number) => Math.round((new Date().setHours(0, 0, 0, 0) - n
 const day = (at : number) => ['Today', 'Yesterday'][daysAgo(at)] ?? dayFormat.format(at)
 const time = (at : number) => timeFormat.format(at)
 
-// Quick tempo changes under the wheel: half time, double time and a 4/4 → 3/4 metric modulation.
-const shifts = [
-	{ factor: 1 / 2, label: '½×', name: 'Half time' },
-	{ factor: 2, label: '2×', name: 'Double time' },
-	{ factor: 3 / 4, label: '4→3', name: 'Metric modulation 4/4 to 3/4' }
-]
-
 const resample = (values : number[], count : number) => Array.from({ length: count }, (_, index) => values[Math.floor(index * values.length / count)] ?? 0)
 
 @customElement('mirror-page')
@@ -80,6 +73,7 @@ class MirrorPage extends SignalWatcher(LitElement) {
 	#copied = ''
 	#copiedTimer = 0
 	#resize = () => this.requestUpdate()
+	#devices = () => void audio.listInputs()
 	#keyboard = (event : KeyboardEvent) => {
 		if (event.altKey || event.ctrlKey || event.metaKey) return
 		const target = event.target as HTMLElement | null
@@ -113,6 +107,8 @@ class MirrorPage extends SignalWatcher(LitElement) {
 		window.addEventListener('keydown', this.#keyboard)
 		window.addEventListener('keyup', this.#release)
 		this.#wide.addEventListener('change', this.#resize)
+		navigator.mediaDevices?.addEventListener('devicechange', this.#devices)
+		void audio.listInputs()
 		this.#registerTools()
 		this.#tick()
 	}
@@ -121,6 +117,7 @@ class MirrorPage extends SignalWatcher(LitElement) {
 		window.removeEventListener('keydown', this.#keyboard)
 		window.removeEventListener('keyup', this.#release)
 		this.#wide.removeEventListener('change', this.#resize)
+		navigator.mediaDevices?.removeEventListener('devicechange', this.#devices)
 		cancelAnimationFrame(this.#frame)
 		clearTimeout(this.#noticeTimer)
 		clearTimeout(this.#deletedTimer)
@@ -164,9 +161,6 @@ class MirrorPage extends SignalWatcher(LitElement) {
 				repeat: 'Mic paused'
 			}[mode]
 		const badge = { off: icons.mic, listen: html`<span class=blink></span>`, repeat: icons.repeat }[mode]
-		const wave = mode === 'listen'
-			? this.#bars(this.#history.slice(-24))
-			: mode === 'repeat' ? this.#bars(resample(phrase?.peaks ?? [], 24), audio.progress) : this.#bars(Array(24).fill(0))
 		const notice = this.#notice
 
 		return html`
@@ -183,7 +177,6 @@ class MirrorPage extends SignalWatcher(LitElement) {
 
 				<section class=stage aria-label=Metronome>
 					${this.#dial()}
-					${this.#tempoBar()}
 					${this.#transport()}
 				</section>
 
@@ -195,26 +188,31 @@ class MirrorPage extends SignalWatcher(LitElement) {
 							<strong>${title}</strong>
 							${keyed(text, html`<span class=${current === 'error' ? 'status error' : 'status'}>${text}</span>`)}
 						</span>
-						${wave}
 					</button>
-					<div class=last-row>
-						${this.#playLast()}
-						<div class=stack>
-							<strong>Last phrase</strong>
-							<span class=meta>${phrase ? this.#length(phrase.duration) : 'Nothing yet'}</span>
-						</div>
-						${this.#saveButton()}
-					</div>
+					${this.#live(mode)}
 				</section>
 
-				<dialog id=settings class=sheet @click=${this.#dismiss}>
-					<div class=grip></div>
-					<header class=sheet-head>
-						<h2>Settings</h2>
-						<button class=icon-button aria-label=Close @click=${this.#closeSettings}>${icons.close}</button>
+				<section class='last-row last-card' aria-label='Last phrase'>
+					${this.#playLast()}
+					<div class=stack>
+						<strong>Last phrase</strong>
+						<span class=meta>${phrase ? this.#length(phrase.duration) : 'Nothing yet'}</span>
+					</div>
+					${this.#saveButton()}
+				</section>
+
+				<dialog id=settings class='sheet settings-sheet' aria-label=Settings @click=${this.#dismiss}>
+					<header class=settings-top>
+						<div class=grip></div>
+						<div class=sheet-head>
+							<h2>Settings</h2>
+							<button class=icon-button aria-label=Close @click=${this.#closeSettings}>${icons.close}</button>
+						</div>
 					</header>
-					${this.#settings(false)}
-					<button class=support-link @click=${this.#openSupport}>${icons.heart}Free &amp; open source · Support the project</button>
+					<div class=settings-body>
+						${this.#settings(false)}
+						<button class=support-link @click=${this.#openSupport}>${icons.heart}Free &amp; open source · Support the project</button>
+					</div>
 				</dialog>
 
 				${this.#library(false)}
@@ -268,7 +266,6 @@ class MirrorPage extends SignalWatcher(LitElement) {
 					<section class='card metronome' aria-label=Metronome>
 						<h2 class=label>Metronome</h2>
 						${this.#dial()}
-						${this.#tempoBar()}
 						${this.#transport()}
 					</section>
 				</aside>
@@ -331,6 +328,8 @@ class MirrorPage extends SignalWatcher(LitElement) {
 			<div class=dial>
 				${this.#pulse()}
 				<bpm-wheel .value=${audio.bpm} @change=${this.#wheel}></bpm-wheel>
+				${audio.bpm === audio.defaultBpm ? '' : html`
+					<button class=reset-tempo aria-label=${`Reset to default tempo, ${audio.defaultBpm} BPM`} @click=${() => this.#tempo(audio.defaultBpm)}>${icons.reset}${audio.defaultBpm}</button>`}
 			</div>
 		`
 	}
@@ -495,17 +494,6 @@ class MirrorPage extends SignalWatcher(LitElement) {
 		return html`<span class=${`pulse ${running ? beat % 2 ? 'odd' : 'even' : ''}`} style=${`--beat: ${audio.beatDuration}s`} aria-hidden=true></span>`
 	}
 
-	#tempoBar () {
-		return html`
-			<div class=tempo-bar role=group aria-label='Quick tempo'>
-				<button aria-label=${`Reset to default tempo, ${audio.defaultBpm} BPM`} @click=${() => this.#tempo(audio.defaultBpm)}>
-					${icons.reset}${audio.defaultBpm}
-				</button>
-				${shifts.map(item => html`<button aria-label=${item.name} @click=${() => this.#tempo(audio.bpm * item.factor)}>${item.label}</button>`)}
-			</div>
-		`
-	}
-
 	#transport () {
 		const running = audio.transport.get()
 		return html`
@@ -546,81 +534,107 @@ class MirrorPage extends SignalWatcher(LitElement) {
 		const sensitivity = 21 - Math.round(audio.threshold * 100)
 		const decibels = Math.round(20 * Math.log10(audio.threshold))
 		const marker = Math.min(1, audio.gate / .35)
+		// Chrome's 'default' and 'communications' entries only repeat a real device.
+		const inputs = audio.inputs.get().filter(item => item.label && item.id !== 'default' && item.id !== 'communications')
+		const input = inputs.some(item => item.id === audio.input) ? audio.input : ''
 
 		return html`
 			<div class=settings>
-				${wide ? html`
-					<label class='field inline'>
-						<span class=field-head>Default tempo</span>
-						<span class=number>
-							<input type=number min=30 max=240 inputmode=numeric .value=${String(audio.defaultBpm)}
-								@change=${(event : Event) => this.#setDefault(event.target as HTMLInputElement)}>
-							<span class=meta>BPM</span>
-						</span>
-					</label>` : html`
-					<div class='field inline'>
-						<span class=stack>
-							<strong>Default tempo</strong>
-							<span class=muted>Where the reset button takes you</span>
-						</span>
-						<span class=stepper role=group aria-label='Default tempo'>
-							<button aria-label='Lower default tempo' ?disabled=${audio.defaultBpm <= 30} @click=${() => this.#set(() => audio.defaultBpm--)}>−</button>
-							<output aria-live=polite>${audio.defaultBpm}</output>
-							<button aria-label='Raise default tempo' ?disabled=${audio.defaultBpm >= 240} @click=${() => this.#set(() => audio.defaultBpm++)}>+</button>
-						</span>
-					</div>`}
+				<section class=group aria-labelledby=${`${wide ? 'd' : 'm'}-metronome`}>
+					<h3 id=${`${wide ? 'd' : 'm'}-metronome`} class=label>Metronome</h3>
+					<div class=group-body>
+						${wide ? html`
+							<label class='field inline'>
+								<span class=field-head>Default tempo</span>
+								<span class=number>
+									<input type=number min=30 max=240 inputmode=numeric .value=${String(audio.defaultBpm)}
+										@change=${(event : Event) => this.#setDefault(event.target as HTMLInputElement)}>
+									<span class=meta>BPM</span>
+								</span>
+							</label>` : html`
+							<div class='field inline'>
+								<span class=stack>
+									<strong>Default tempo</strong>
+									<span class=muted>Where the reset button takes you</span>
+								</span>
+								<span class=stepper role=group aria-label='Default tempo'>
+									<button aria-label='Lower default tempo' ?disabled=${audio.defaultBpm <= 30} @click=${() => this.#set(() => audio.defaultBpm--)}>−</button>
+									<output aria-live=polite>${audio.defaultBpm}</output>
+									<button aria-label='Raise default tempo' ?disabled=${audio.defaultBpm >= 240} @click=${() => this.#set(() => audio.defaultBpm++)}>+</button>
+								</span>
+							</div>`}
 
-				<fieldset>
-					<legend>End of phrase <span class=muted>How much silence counts as a pause</span></legend>
-					<div class=segmented>
-						${endings.map(item => html`
-							<button aria-pressed=${audio.silenceBeats === item.beats} @click=${() => this.#set(() => audio.silenceBeats = item.beats)}>${item.label}</button>
-						`)}
+						<fieldset>
+							<legend>Sound</legend>
+							<div class=${wide ? 'chips' : 'segmented'}>
+								${sounds.map(item => html`
+									<button class=${wide ? 'chip' : ''} aria-pressed=${audio.sound === item.value} @click=${() => this.#set(() => audio.sound = item.value)}>${item.label}</button>
+								`)}
+							</div>
+						</fieldset>
+
+						<label class=field>
+							<span class=field-head>Volume <span class=meta>${Math.round(audio.metronomeVolume * 100)}%</span></span>
+							<input type=range min=0 max=100 .value=${String(Math.round(audio.metronomeVolume * 100))}
+								@input=${(event : Event) => this.#set(() => audio.metronomeVolume = Number((event.target as HTMLInputElement).value) / 100)}>
+						</label>
 					</div>
-				</fieldset>
+				</section>
 
-				<fieldset>
-					<legend>Recording buffer <span class=muted>Longest phrase that can be captured</span></legend>
-					<div class=segmented>
-						${buffers.map(item => html`
-							<button aria-pressed=${audio.bufferSeconds === item.seconds} @click=${() => this.#set(() => audio.bufferSeconds = item.seconds)}>${item.label}</button>
-						`)}
+				<section class=group aria-labelledby=${`${wide ? 'd' : 'm'}-microphone`}>
+					<h3 id=${`${wide ? 'd' : 'm'}-microphone`} class=label>Microphone</h3>
+					<div class=group-body>
+						<label class=field>
+							<span class=field-head>Input</span>
+							<select class=select @change=${(event : Event) => this.#set(() => audio.input = (event.target as HTMLSelectElement).value)}>
+								<option value='' ?selected=${!input}>Default microphone</option>
+								${inputs.map(item => html`<option value=${item.id} ?selected=${item.id === input}>${item.label}</option>`)}
+							</select>
+						</label>
+
+						<label class=field>
+							<span class=field-head>Sensitivity <span class=meta>${decibels} dB</span></span>
+							<span class=level style=${`--level: ${audio.level.get()}; --marker: ${marker}`} aria-hidden=true></span>
+							<input type=range min=1 max=20 .value=${String(sensitivity)}
+								@input=${(event : Event) => this.#set(() => audio.threshold = (21 - Number((event.target as HTMLInputElement).value)) / 100)}>
+							<span class=muted>Anything below the marker counts as silence. Play something to check.</span>
+						</label>
 					</div>
-				</fieldset>
+				</section>
 
-				<label class=field>
-					<span class=field-head>Mic sensitivity <span class=meta>${decibels} dB</span></span>
-					<span class=level style=${`--level: ${audio.level.get()}; --marker: ${marker}`} aria-hidden=true></span>
-					<input type=range min=1 max=20 .value=${String(sensitivity)}
-						@input=${(event : Event) => this.#set(() => audio.threshold = (21 - Number((event.target as HTMLInputElement).value)) / 100)}>
-					<span class=muted>Anything below the marker counts as silence. Play something to check.</span>
-				</label>
+				<section class=group aria-labelledby=${`${wide ? 'd' : 'm'}-playback`}>
+					<h3 id=${`${wide ? 'd' : 'm'}-playback`} class=label>Auto Playback</h3>
+					<div class=group-body>
+						<fieldset>
+							<legend>End of phrase <span class=muted>How much silence counts as a pause</span></legend>
+							<div class=segmented>
+								${endings.map(item => html`
+									<button aria-pressed=${audio.silenceBeats === item.beats} @click=${() => this.#set(() => audio.silenceBeats = item.beats)}>${item.label}</button>
+								`)}
+							</div>
+						</fieldset>
 
-				<label class=field>
-					<span class=field-head>Playback volume <span class=meta>${Math.round(audio.volume * 100)}%</span></span>
-					<input type=range min=0 max=100 .value=${String(Math.round(audio.volume * 100))}
-						@input=${(event : Event) => this.#set(() => audio.volume = Number((event.target as HTMLInputElement).value) / 100)}>
-				</label>
+						<fieldset>
+							<legend>Recording buffer <span class=muted>Longest phrase that can be captured</span></legend>
+							<div class=segmented>
+								${buffers.map(item => html`
+									<button aria-pressed=${audio.bufferSeconds === item.seconds} @click=${() => this.#set(() => audio.bufferSeconds = item.seconds)}>${item.label}</button>
+								`)}
+							</div>
+						</fieldset>
 
-				<label class=field>
-					<span class=field-head>Metronome volume <span class=meta>${Math.round(audio.metronomeVolume * 100)}%</span></span>
-					<input type=range min=0 max=100 .value=${String(Math.round(audio.metronomeVolume * 100))}
-						@input=${(event : Event) => this.#set(() => audio.metronomeVolume = Number((event.target as HTMLInputElement).value) / 100)}>
-				</label>
-
-				<fieldset>
-					<legend>Metronome sound</legend>
-					<div class=chips>
-						${sounds.map(item => html`
-							<button class=chip aria-pressed=${audio.sound === item.value} @click=${() => this.#set(() => audio.sound = item.value)}>${item.label}</button>
-						`)}
+						<label class=field>
+							<span class=field-head>Playback volume <span class=meta>${Math.round(audio.volume * 100)}%</span></span>
+							<input type=range min=0 max=100 .value=${String(Math.round(audio.volume * 100))}
+								@input=${(event : Event) => this.#set(() => audio.volume = Number((event.target as HTMLInputElement).value) / 100)}>
+						</label>
 					</div>
-				</fieldset>
+				</section>
 			</div>
 		`
 	}
 
-		#bars (values : number[], progress? : number) {
+	#bars (values : number[], progress? : number) {
 		return html`
 			<span class=bars aria-hidden=true>
 				${values.map((value, index) => html`<span class=${progress !== undefined && index / values.length >= progress ? 'bar ahead' : 'bar'} style=${`--h: ${value}`}></span>`)}
@@ -629,15 +643,41 @@ class MirrorPage extends SignalWatcher(LitElement) {
 	}
 
 	#position () {
-		const current = audio.status.get()
-		const phrase = audio.phrase.get()
-		const seconds = current === 'recording'
-			? (performance.now() - this.#recordedAt) / 1000
-			: current === 'playing' && phrase ? Math.max(0, audio.progress * phrase.duration - phrase.onset) : -1
+		const seconds = this.#elapsed()
 		if (seconds < 0) return '—'
 
 		const beats = Math.floor(seconds / audio.beatDuration)
 		return `${Math.floor(beats / 4) + 1}.${beats % 4 + 1}`
+	}
+
+	// Seconds into what is being recorded or played back, or -1 with nothing going on.
+	#elapsed () {
+		const current = audio.status.get()
+		const phrase = audio.phrase.get()
+		const recorder = audio.recorder.get()
+		if (recorder) return (performance.now() - recorder) / 1000
+		if (current === 'recording') return (performance.now() - this.#recordedAt) / 1000
+		return current === 'playing' && phrase ? Math.max(0, audio.progress * phrase.duration - phrase.onset) : -1
+	}
+
+	// Mobile: where the phrase is, bar · beat, with its waveform as it is heard or played back.
+	#live (mode : Mode) {
+		const seconds = this.#elapsed()
+		const recorder = Boolean(audio.recorder.get())
+		const phrase = audio.phrase.get()
+		const wave = recorder || mode === 'off' && !this.#replaying ? this.#bars(Array(48).fill(0))
+			: mode === 'listen' ? this.#bars(this.#history.slice(-48))
+			: this.#bars(resample(phrase?.peaks ?? [], 48), audio.progress)
+
+		return html`
+			<div class=${`live ${seconds < 0 ? 'idle' : ''} ${recorder ? 'rec' : ''}`} aria-hidden=true>
+				<div class=live-head>
+					<span class=live-position><strong>${seconds < 0 ? '1.1' : this.#position()}</strong><span class=muted>bar · beat</span></span>
+					<span class=live-clock>${clock(Math.max(0, seconds))}</span>
+				</div>
+				${wave}
+			</div>
+		`
 	}
 
 	#length (duration : number) {
