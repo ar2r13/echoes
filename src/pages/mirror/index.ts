@@ -747,8 +747,10 @@ class MirrorPage extends SignalWatcher(LitElement) {
 			const recording = await recordings.add(blob, { duration, bpm: audio.bpm, peaks })
 			if (announce) this.#notify({ heading: 'Saved to recordings', detail: `${recording.name} · ${clock(duration)}`, pill: `${recording.name} saved · ${clock(duration)}` })
 			return true
-		} catch {
-			this.#notify({ heading: 'Could not save', detail: 'This browser blocks storage here', pill: 'Could not save — this browser blocks storage here', failed: true })
+		} catch (error) {
+			const detail = error instanceof Error ? `${error.name}: ${error.message}` : 'Unknown storage error'
+			console.error('Could not save recording', error)
+			this.#notify({ heading: 'Could not save', detail, pill: `Could not save — ${detail}`, failed: true })
 			return false
 		}
 	}

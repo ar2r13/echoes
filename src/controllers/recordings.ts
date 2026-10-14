@@ -14,6 +14,8 @@ const removals = 'removed.json'
 
 const newest = (a : Recording, b : Recording) => b.created - a.created
 
+type Storage = { read : (name : string) => Promise<Blob>, write : (name : string, blob : Blob) => Promise<void>, remove : (name : string) => Promise<void> }
+
 // Takes are plain audio files in the origin private file system, with their details in index.json
 // beside them. It is site data, not the HTTP cache, so clearing cached files keeps them.
 // It fires `change` when the person adds or deletes a take, so a backup can follow.
@@ -21,7 +23,8 @@ class RecordingsController extends EventTarget {
 	readonly list = new Signal.State<Recording[]>([])
 
 	#removed : Removal[] = []
-	#folder : Promise<FileSystemDirectoryHandle> | null = null
+	#storage : Promise<Storage> | null = null
+	#database : Promise<IDBDatabase> | null = null
 	// Index writes run one after another, so a slow one never lands over a newer list.
 	#queue : Promise<unknown> = Promise.resolve()
 	readonly ready = this.#load()
@@ -45,8 +48,7 @@ class RecordingsController extends EventTarget {
 	}
 
 	async open (recording : Recording) {
-		const folder = await this.#open()
-		return await (await folder.getFileHandle(recording.file)).getFile()
+		return await (await this.#open()).read(recording.file)
 	}
 
 	// Returns the audio held in memory, so an undo can write it back. A take only on Drive has none.
@@ -59,7 +61,7 @@ class RecordingsController extends EventTarget {
 		}
 		if (recording.drive) await this.#saveRemoved([...this.#removed, { id: recording.id, drive: recording.drive }])
 		await this.#save(this.list.get().filter(item => item.id !== recording.id))
-		if (blob) await (await this.#open()).removeEntry(recording.file).catch(() => {})
+		if (blob) await (await this.#open()).remove(recording.file).catch(() => {})
 		this.dispatchEvent(new Event('change'))
 
 		return blob
@@ -109,8 +111,8 @@ class RecordingsController extends EventTarget {
 		const gone = this.list.get().filter(item => ids.includes(item.id))
 		if (!gone.length) return
 		await this.#save(this.list.get().filter(item => !ids.includes(item.id)))
-		const folder = await this.#open()
-		await Promise.all(gone.filter(item => item.sync !== 'cloud').map(item => folder.removeEntry(item.file).catch(() => {})))
+		const storage = await this.#open()
+		await Promise.all(gone.filter(item => item.sync !== 'cloud').map(item => storage.remove(item.file).catch(() => {})))
 	}
 
 	async forget (drive : string) {
@@ -125,15 +127,47 @@ class RecordingsController extends EventTarget {
 	}
 
 	#open () {
-		return this.#folder ??= navigator.storage.getDirectory().then(root => root.getDirectoryHandle('recordings', { create: true }))
+		return this.#storage ??= this.#fileSystem().catch(() => this.#indexedDB())
+	}
+
+	async #fileSystem () : Promise<Storage> {
+		const folder = await (await navigator.storage.getDirectory()).getDirectoryHandle('recordings', { create: true })
+		return {
+			read: async name => await (await folder.getFileHandle(name)).getFile(),
+			write: async (name, blob) => {
+				const writable = await (await folder.getFileHandle(name, { create: true })).createWritable()
+				await writable.write(blob)
+				await writable.close()
+			},
+			remove: async name => await folder.removeEntry(name)
+		}
+	}
+
+	async #indexedDB () : Promise<Storage> {
+		const database = await (this.#database ??= new Promise((resolve, reject) => {
+			const request = indexedDB.open('auto-playback-recordings', 1)
+			request.onupgradeneeded = () => request.result.createObjectStore('files')
+			request.onsuccess = () => resolve(request.result)
+			request.onerror = () => reject(request.error)
+		}))
+		const request = <T>(mode : IDBTransactionMode, action : (files : IDBObjectStore) => IDBRequest<T>) => new Promise<T>((resolve, reject) => {
+			const result = action(database.transaction('files', mode).objectStore('files'))
+			result.onsuccess = () => resolve(result.result)
+			result.onerror = () => reject(result.error)
+		})
+		return {
+			read: async name => await request<Blob>('readonly', files => files.get(name)),
+			write: async (name, blob) => void await request('readwrite', files => files.put(blob, name)),
+			remove: async name => void await request('readwrite', files => files.delete(name))
+		}
 	}
 
 	async #load () {
 		try {
-			const folder = await this.#open()
-			const file = await (await folder.getFileHandle(index)).getFile()
+			const storage = await this.#open()
+			const file = await storage.read(index)
 			this.list.set((JSON.parse(await file.text()) as Recording[]).sort(newest))
-			this.#removed = JSON.parse(await (await (await folder.getFileHandle(removals)).getFile()).text()) as Removal[]
+			this.#removed = JSON.parse(await (await storage.read(removals)).text()) as Removal[]
 		} catch {
 			// No index yet, or no file system here (some private modes): saving reports it.
 		}
@@ -162,10 +196,7 @@ class RecordingsController extends EventTarget {
 	}
 
 	async #write (name : string, blob : Blob) {
-		const folder = await this.#open()
-		const writable = await (await folder.getFileHandle(name, { create: true })).createWritable()
-		await writable.write(blob)
-		await writable.close()
+		await (await this.#open()).write(name, blob)
 	}
 }
 
